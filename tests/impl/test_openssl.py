@@ -109,7 +109,9 @@ class Adapters:
         for proc in self.procs:
             if proc.poll() is None:
                 proc.kill()
-                proc.wait()
+            # Popen's context exit waits and closes stdout, which finish() may not have read.
+            with proc:
+                pass
 
 
 @pytest.fixture(params=VARIANTS)
