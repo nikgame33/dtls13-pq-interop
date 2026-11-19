@@ -26,7 +26,7 @@ The conformance suite in `tests/conformance/` checks every rule in this document
 ```
 run --role=client|server
     --variant=NAME                       # both; "default" or a name from the variants file
-    --host=HOST --port=PORT              # both; the server binds, the client connects
+    --host=HOST --port=PORT              # both; the server binds (0 = any free port), the client connects
     --groups=G1[,G2...]                  # both; preference order, IANA names
     --mtu=N|default                      # both; path MTU at the IP layer, see below
     --ca=FILE                            # both; the client verifies the server as "localhost"
@@ -75,7 +75,8 @@ Each implementation's README states how this maps to the library's MTU API.
 
 ### Lifecycle and teardown
 
-1. Server: bind, print `ready`, accept one connection.
+1. Server: bind, print `ready` with the bound port, accept one connection.
+The runner passes `--port=0`, so the port is never picked by one process and bound by another.
 2. Client: complete the handshake, send `ping`, read `pong`, send close_notify, wait up to 2 s for the server's close_notify, print the result, exit.
 3. Server: answer `ping` with `pong`, wait up to 2 s for the client's close_notify, send its own close_notify, print the result, exit.
 
@@ -90,7 +91,7 @@ PSK resumption (scenario S10) and a TLS-over-TCP mode (scenario T01) are not def
 
 stdout carries only JSON lines; everything else goes to stderr and is kept in the run log.
 
-- Server, once its socket is bound and it accepts datagrams: `{"event": "ready"}`.
+- Server, once its socket is bound and it accepts datagrams: `{"event": "ready", "port": 40123}` with the port actually bound.
 The runner starts the client only after this line.
 - Both roles, last line before exit:
 
