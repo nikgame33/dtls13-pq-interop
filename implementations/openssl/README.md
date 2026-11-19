@@ -20,7 +20,7 @@ Both roles pin the protocol to DTLS 1.3 (`SSL_CTX_set_min/max_proto_version(DTLS
 The listener is what OpenSSL documents for DTLS 1.3 servers.
 `accept` is the pattern of applications that demultiplex peers themselves and give each peer a connected socket; it uses different code for address validation, sending (`BIO_write` instead of `BIO_sendmmsg`) and the default MTU.
 `DTLSv1_listen()` is not a variant because it does not support DTLS 1.3 (DTLSv1_listen(3) in 4.1.0).
-The client has a single code path (`SSL_connect` on a connected socket) and accepts both variant names.
+`variants` lists `accept` for the server role only; the client has a single code path (`SSL_connect` on a connected socket), so it accepts only `--variant=default` and exits 64 otherwise.
 
 ## Option mapping
 

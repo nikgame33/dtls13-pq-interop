@@ -622,7 +622,7 @@ static int usage(const char *fmt, const char *arg)
 
     snprintf(msg, sizeof(msg), fmt, arg);
     fprintf(stderr,
-        "usage: run --role=client --variant=default|accept --host=HOST --port=PORT\n"
+        "usage: run --role=client --variant=default --host=HOST --port=PORT\n"
         "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --key-share=GROUP|empty|default\n"
         "       run --role=server --variant=default|accept --host=HOST --port=PORT\n"
         "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --validate=off|cookie\n"
@@ -683,8 +683,9 @@ static int parse_options(int argc, char **argv)
     }
 
     v = g_opts.val[OPT_VARIANT];
-    if (strcmp(v, "default") != 0 && strcmp(v, "accept") != 0)
-        return usage("unknown --variant=%s", v);
+    /* accept is a server-only variant (variants file); clients only have the default path. */
+    if (strcmp(v, "default") != 0 && !(g_opts.server && strcmp(v, "accept") == 0))
+        return usage("--variant=%s is not a variant of this role", v);
     g_opts.accept_variant = strcmp(v, "accept") == 0;
     if (*g_opts.val[OPT_HOST] == '\0')
         return usage("--host must not be empty", NULL);

@@ -71,7 +71,8 @@ class Adapters:
         """Every option of the role as --opt=value; a None override drops that option."""
         base: dict[str, str | None] = {
             "role": role,
-            "variant": self.variant,
+            # Variants are server-only; the client always runs the default path.
+            "variant": self.variant if role == "server" else "default",
             "host": HOST,
             "port": str(port),
             "groups": "X25519",
@@ -338,6 +339,7 @@ USAGE_ERRORS = {
         "bad-mtu": {"mtu": "big"},
         "bad-port": {"port": "0"},
         "bad-variant": {"variant": "nope"},
+        "server-variant": {"variant": "accept"},
         "share-not-in-groups": {"key_share": MLKEM},
         "empty-group": {"groups": "X25519,,X448"},
     },
@@ -349,6 +351,7 @@ USAGE_ERRORS = {
         "bad-validate": {"validate": "maybe"},
         "bad-port": {"port": "70000"},
         "bad-mtu": {"mtu": "48"},
+        "bad-variant": {"variant": "nope"},
     },
 }
 
