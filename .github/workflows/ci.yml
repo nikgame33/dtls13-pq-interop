@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    name: Lint and unit/E2E tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      # Implementation-specific tests skip here; the implementation job runs them against real builds.
+      - run: uv run pytest
+
+  discover:
+    name: Discover implementations
+    runs-on: ubuntu-24.04
+    outputs:
+      names: ${{ steps.list.outputs.names }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        run: |
+          names=$(find implementations -mindepth 2 -maxdepth 2 -name build.sh -printf '%h\n' \
+            | xargs -r -n1 basename | sort | jq -R . | jq -cs .)
+          echo "names=${names:-[]}" >> "$GITHUB_OUTPUT"
+
+  implementation:
+    name: Build and test ${{ matrix.name }}
+    needs: discover
+    if: needs.discover.outputs.names != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.discover.outputs.names) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - run: uv sync --locked
+      - uses: actions/cache@v6
+        with:
+          path: .build/${{ matrix.name }}
+          key: build-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles(format('implementations/{0}/build.sh', matrix.name), format('implementations/{0}/*.patch', matrix.name)) }}
+      - name: Build
+        run: implementations/${{ matrix.name }}/build.sh
+      - name: Adapter tests
+        env:
+          DTLS_INTEROP_REQUIRE: ${{ matrix.name }}
+        run: uv run pytest tests/impl/test_${{ matrix.name }}.py
