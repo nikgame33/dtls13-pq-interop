@@ -1,4 +1,4 @@
-# Adapter interface (draft)
+# Adapter interface
 
 Each implementation provides `implementations/<name>/build.sh` and an adapter executable `implementations/<name>/run`.
 The harness only talks to the adapter, never to library-specific tools directly.
@@ -8,6 +8,8 @@ The harness only talks to the adapter, never to library-specific tools directly.
 `build.sh` fetches the pinned upstream source, verifies it (tag + commit hash or tarball checksum), and installs into `.build/<name>/`.
 It must be idempotent and must not touch anything outside `.build/`.
 As its last step it creates the marker file `.build/<name>/.built`; tests treat an implementation without the marker as unbuilt.
+The first line of `.built` is the pinned version (e.g. `openssl 4.1.0`); further lines may list build flags.
+The runner records that first line as the implementation version.
 CI caches `.build/<name>/` keyed on `build.sh` and any `*.patch` in the implementation directory.
 
 ## Tests
@@ -19,18 +21,29 @@ CI runs them per implementation with `DTLS_INTEROP_REQUIRE=<name>`, which turns 
 ## Run
 
 ```
-run --role client|server
-    --host HOST --port PORT
-    --groups G1[,G2...]            # preference order, IANA names
-    --key-share GROUP|empty         # client only: what goes into CH1 key_share
-    --mtu N                         # DTLS record/fragment size the library should use
-    --validate off|cookie           # server only: stateless HRR cookie for new peers
-    --cert FILE --key FILE --ca FILE
-    [--psk-in FILE] [--psk-out FILE]
+run --role=client|server
+    --host=HOST --port=PORT
+    --groups=G1[,G2...]             # preference order, IANA names
+    --key-share=GROUP|empty         # client only: what goes into CH1 key_share
+    --mtu=N                         # path MTU at the IP layer, see below
+    --validate=off|cookie           # server only: stateless HRR cookie for new peers
+    --cert=FILE --key=FILE          # server only
+    --ca=FILE                       # both; the client verifies the server as "localhost"
 ```
+
+The runner passes every option as `--opt=value`; adapters must accept that form and should also accept `--opt value`.
+
+`--mtu N` uses the same unit as the proxy's `pmtu`: the path MTU at the IP layer.
+The adapter configures the library so that no UDP payload exceeds N - 48 bytes (IPv6 40 + UDP 8), e.g. 1232 bytes for N = 1280.
+Each implementation's README states how this maps to the library's MTU API.
+
+PSK resumption (`--psk-in`/`--psk-out`, scenario S10) and a TLS-over-TCP mode (scenario T01) are not defined yet.
 
 Client behaviour: complete the handshake, send `ping`, expect `pong`, exit.
 Server behaviour: accept one connection, answer `ping` with `pong`, exit.
+
+Adapters stay in the process group the runner starts them in and never daemonize.
+The runner kills the group at the case timeout, and the server 5 s after the client has exited.
 
 ## Output protocol
 

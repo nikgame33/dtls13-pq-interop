@@ -37,7 +37,7 @@ Every scenario runs for every (client, server) pair, including same-implementati
 
 ## Recorded per run
 
-- Outcome: pass, fail (with alert / error), unsupported (adapter exit 2), timeout.
+- Outcome: pass, fail (with alert / error), unsupported (adapter exit 2), timeout, error (harness or adapter protocol problem, not a library verdict).
 - Datagram trace from the proxy: direction, size, timing and action per datagram.
 Record and handshake headers are derived with `records.parse_datagram(d.payload)` on each trace entry.
 - CH1/CH2 total size and fragment count.
