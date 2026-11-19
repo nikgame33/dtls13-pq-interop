@@ -1,0 +1,1 @@
+server accept-tls13: The server calls wolfSSL_accept_TLSv13() instead of wolfSSL_accept(), which marks the connection stateful when the HRR cookie is off and so reassembles a fragmented first ClientHello.

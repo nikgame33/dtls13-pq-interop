@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
 import re
 import selectors
@@ -24,6 +23,8 @@ READY_TIMEOUT = 10.0
 RUN_TIMEOUT = 20.0
 # Scenarios expected to hang (silently dropped datagrams) only need a few retransmissions.
 HANG_TIMEOUT = 8.0
+EXIT_UNSUPPORTED = 2
+EXIT_USAGE = 64
 
 
 @dataclass
@@ -37,12 +38,6 @@ class Outcome:
 class PairOutcome:
     server: Outcome
     client: Outcome
-
-
-def _free_udp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind((HOST, 0))
-        return s.getsockname()[1]
 
 
 def _result_line(stdout: str) -> dict | None:
@@ -65,7 +60,8 @@ def _finish(proc: subprocess.Popen[str], timeout: float) -> Outcome:
     return Outcome(rc=rc, result=_result_line(out), stderr=err)
 
 
-def _wait_ready(proc: subprocess.Popen[str]) -> None:
+def _wait_ready(proc: subprocess.Popen[str]) -> int:
+    """Wait for the server's ready line and return the port it bound."""
     assert proc.stdout is not None
     lines: queue.Queue[str] = queue.Queue()
     threading.Thread(target=lambda: lines.put(proc.stdout.readline()), daemon=True).start()
@@ -74,13 +70,24 @@ def _wait_ready(proc: subprocess.Popen[str]) -> None:
     except queue.Empty:
         proc.kill()
         pytest.fail(f"server not ready after {READY_TIMEOUT}s: {proc.communicate()[1]}")
-    if json.loads(line or "{}").get("event") != "ready":
-        pytest.fail(f"expected ready line, got {line!r}; stderr: {proc.communicate()[1]}")
+    ready = json.loads(line or "{}")
+    if ready.get("event") != "ready" or not 0 < ready.get("port", 0) < 65536:
+        pytest.fail(f"expected ready line with port, got {line!r}; stderr: {proc.communicate()[1]}")
+    return ready["port"]
 
 
 @pytest.fixture
 def wolfssl(require_impl: Callable[[str], Implementation]) -> Implementation:
     return require_impl("wolfssl")
+
+
+def _base(wolfssl: Implementation, test_pki: pki.TestPki, role: str, variant: str) -> list[str]:
+    """Role-specific required options in the runner's --opt=value form."""
+    cmd = [str(wolfssl.adapter), f"--role={role}", f"--variant={variant}", f"--host={HOST}"]
+    cmd.append(f"--ca={test_pki.ca_cert}")
+    if role == "server":
+        cmd += [f"--cert={test_pki.server_cert}", f"--key={test_pki.server_key}"]
+    return cmd
 
 
 @pytest.fixture
@@ -91,25 +98,21 @@ def run_pair(wolfssl: Implementation, test_pki: pki.TestPki) -> Callable[..., Pa
         *,
         via: Callable[[int], AbstractContextManager[int]] | None = None,
         timeout: float = RUN_TIMEOUT,
-        server_env: dict[str, str] | None = None,
+        variant: str = "default",
     ) -> PairOutcome:
-        port = _free_udp_port()
-        # The runner passes --opt=value; the server gets cert, key and CA, the client only the CA.
-        ca = f"--ca={test_pki.ca_cert}"
-        server_pki = [f"--cert={test_pki.server_cert}", f"--key={test_pki.server_key}", ca]
-        base = [str(wolfssl.adapter), f"--host={HOST}"]
+        # The only wolfSSL variant is server-only, so the client always runs "default".
         server = subprocess.Popen(
-            [*base, "--role=server", f"--port={port}", *server_pki, *server_args],
+            [*_base(wolfssl, test_pki, "server", variant), "--port=0", *server_args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env={**os.environ, **(server_env or {})},
         )
         try:
-            _wait_ready(server)
+            port = _wait_ready(server)
             with (via or _direct)(port) as client_port:
+                client_cmd = _base(wolfssl, test_pki, "client", "default")
                 client = subprocess.Popen(
-                    [*base, "--role=client", f"--port={client_port}", ca, *client_args],
+                    [*client_cmd, f"--port={client_port}", *client_args],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -130,12 +133,20 @@ def _direct(port: int) -> Iterator[int]:
     yield port
 
 
-def _assert_ok(o: PairOutcome, group: str, hrr: bool, mtu: int | None = None) -> None:
+def _tx_sizes(stderr: str) -> list[int]:
+    return [int(n) for n in re.findall(r"\] tx (\d+)B", stderr)]
+
+
+def _assert_ok(
+    o: PairOutcome,
+    group: str,
+    hrr: bool,
+    *,
+    cookie: bool = False,
+    hrr_group: bool = False,
+    max_datagram: int | None = None,
+) -> None:
     for role, side in (("client", o.client), ("server", o.server)):
-        if mtu is not None:
-            # --mtu is the IP path MTU: no UDP payload may exceed mtu - 48 (IPv6 + UDP headers).
-            sizes = [int(n) for n in re.findall(r"\] tx (\d+)B", side.stderr)]
-            assert sizes and max(sizes) <= mtu - 48, f"{role} sent {sizes}"
         assert side.rc == 0, f"{role} rc={side.rc} result={side.result}\n{side.stderr}"
         assert side.result == {
             "event": "result",
@@ -143,11 +154,16 @@ def _assert_ok(o: PairOutcome, group: str, hrr: bool, mtu: int | None = None) ->
             "version": "DTLSv1.3",
             "group": group,
             "hrr": hrr,
+            "hrr_cookie": hrr and cookie,
+            "hrr_group": hrr and hrr_group,
             "error": None,
         }, f"{role}: {side.stderr}"
+        if max_datagram is not None:
+            sizes = _tx_sizes(side.stderr)
+            assert sizes and max(sizes) <= max_datagram, f"{role} sent {sizes}"
 
 
-def _args(groups: str, mtu: int, validate: str, key_share: str | None = None) -> tuple:
+def _args(groups: str, mtu: int | str, validate: str, key_share: str | None = None) -> tuple:
     server = [f"--groups={groups}", f"--mtu={mtu}", f"--validate={validate}"]
     client = [f"--groups={groups}", f"--mtu={mtu}", f"--key-share={key_share or groups}"]
     return server, client
@@ -156,7 +172,8 @@ def _args(groups: str, mtu: int, validate: str, key_share: str | None = None) ->
 @pytest.mark.parametrize("validate", ["off", "cookie"])
 def test_x25519_self_interop(run_pair, validate: str) -> None:
     o = run_pair(*_args("X25519", 1500, validate))
-    _assert_ok(o, "X25519", hrr=validate == "cookie")
+    # The cookie-only HRR carries no key_share: the share was acceptable.
+    _assert_ok(o, "X25519", hrr=validate == "cookie", cookie=True, hrr_group=False)
 
 
 @pytest.mark.parametrize("mtu", [1500, 1280])
@@ -164,13 +181,21 @@ def test_x25519_self_interop(run_pair, validate: str) -> None:
 def test_x25519mlkem768_self_interop(run_pair, mtu: int, validate: str) -> None:
     o = run_pair(*_args("X25519MLKEM768", mtu, validate))
     # At MTU 1280 CH1 does not fit, so the client sends an empty key_share (xfail test below).
-    _assert_ok(o, "X25519MLKEM768", hrr=validate == "cookie" or mtu == 1280, mtu=mtu)
+    hrr = validate == "cookie" or mtu == 1280
+    _assert_ok(
+        o,
+        "X25519MLKEM768",
+        hrr=hrr,
+        cookie=validate == "cookie",
+        hrr_group=mtu == 1280,
+        max_datagram=mtu - 48,  # --mtu is the IP path MTU; IPv6 + UDP headers take 48 bytes
+    )
 
 
 @pytest.mark.parametrize("validate", ["off", "cookie"])
 def test_secp256r1mlkem768_self_interop(run_pair, validate: str) -> None:
     o = run_pair(*_args("SecP256r1MLKEM768", 1500, validate))
-    _assert_ok(o, "SecP256r1MLKEM768", hrr=validate == "cookie", mtu=1500)
+    _assert_ok(o, "SecP256r1MLKEM768", hrr=validate == "cookie", cookie=True, max_datagram=1452)
 
 
 @pytest.mark.xfail(
@@ -181,45 +206,177 @@ def test_secp256r1mlkem768_self_interop(run_pair, validate: str) -> None:
 )
 def test_client_sends_full_pq_share_in_fragmented_ch1(run_pair) -> None:
     o = run_pair(*_args("X25519MLKEM768", 1280, "off"))
-    _assert_ok(o, "X25519MLKEM768", hrr=False, mtu=1280)
+    _assert_ok(o, "X25519MLKEM768", hrr=False, max_datagram=1232)
+
+
+def test_default_mtu_is_1400_and_too_small_for_x25519mlkem768_ch1(run_pair) -> None:
+    o = run_pair(*_args("X25519MLKEM768", "default", "off"))
+    # WOLFSSL_MAX_MTU is 1400 and the X25519MLKEM768 CH1 is 1403 bytes, so the share is dropped.
+    _assert_ok(o, "X25519MLKEM768", hrr=True, hrr_group=True, max_datagram=1400)
+    assert max(_tx_sizes(o.client.stderr)) == 1400, o.client.stderr
+
+
+def test_default_key_share_is_first_group(run_pair) -> None:
+    server = ["--groups=X25519MLKEM768,X25519", "--mtu=1500", "--validate=off"]
+    client = ["--groups=X25519,X25519MLKEM768", "--mtu=1500", "--key-share=default"]
+    o = run_pair(server, client)
+    _assert_ok(o, "X25519", hrr=False)
+    assert "51:38(0x001d)" in o.client.stderr, o.client.stderr
+
+
+def test_server_selects_key_share_first(run_pair) -> None:
+    # Contract rule 1: an acceptable share wins over a group the server ranks higher.
+    server = ["--groups=X25519MLKEM768,X25519", "--mtu=1500", "--validate=off"]
+    client = ["--groups=X25519MLKEM768,X25519", "--mtu=1500", "--key-share=X25519"]
+    _assert_ok(run_pair(server, client), "X25519", hrr=False)
 
 
 @pytest.mark.parametrize("validate", ["off", "cookie"])
 def test_empty_key_share_triggers_hrr(run_pair, validate: str) -> None:
-    o = run_pair(*_args("X25519MLKEM768", 1500, validate, key_share="empty"))
-    _assert_ok(o, "X25519MLKEM768", hrr=True)
+    # Contract rule 2: the HRR selects the server's highest-ranked group the client supports.
+    server = ["--groups=X25519MLKEM768,X25519", "--mtu=1500", f"--validate={validate}"]
+    client = ["--groups=X25519,X25519MLKEM768", "--mtu=1500", "--key-share=empty"]
+    o = run_pair(server, client)
+    _assert_ok(o, "X25519MLKEM768", hrr=True, cookie=validate == "cookie", hrr_group=True)
 
 
 def test_wrong_guess_triggers_hrr(run_pair) -> None:
     server = ["--groups=X25519MLKEM768", "--mtu=1500", "--validate=off"]
     client = ["--groups=X25519,X25519MLKEM768", "--mtu=1500", "--key-share=X25519"]
-    _assert_ok(run_pair(server, client), "X25519MLKEM768", hrr=True)
+    _assert_ok(run_pair(server, client), "X25519MLKEM768", hrr=True, hrr_group=True)
+
+
+def test_no_mutual_group_fails(run_pair) -> None:
+    server = ["--groups=X25519MLKEM768", "--mtu=1500", "--validate=off"]
+    client = ["--groups=X25519", "--mtu=1500", "--key-share=X25519"]
+    o = run_pair(server, client)
+    for role, side in (("client", o.client), ("server", o.server)):
+        assert side.rc == 1, f"{role} rc={side.rc}\n{side.stderr}"
+        assert side.result is not None and side.result["ok"] is False
+
+
+def test_teardown_exchanges_close_notify(run_pair) -> None:
+    o = run_pair(*_args("X25519", 1500, "off"))
+    _assert_ok(o, "X25519", hrr=False)
+    assert "received the server's close_notify" in o.client.stderr, o.client.stderr
+    assert "received the client's close_notify" in o.server.stderr, o.server.stderr
+
+
+def _variants(wolfssl: Implementation) -> dict[str, set[str]]:
+    """Variant name -> roles, from 'ROLE NAME: description' lines."""
+    variants = {}
+    for line in (wolfssl.adapter.parent / "variants").read_text().splitlines():
+        role, name = line.split(":", 1)[0].split()
+        variants[name] = {"client", "server"} if role == "both" else {role}
+    return variants
+
+
+def _run_once(cmd: list[str]) -> tuple[int, dict | None]:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=RUN_TIMEOUT)
+    return proc.returncode, _result_line(proc.stdout)
+
+
+@pytest.mark.parametrize("role", ["client", "server"])
+def test_variants_are_accepted_only_in_their_roles(
+    wolfssl: Implementation, test_pki: pki.TestPki, role: str
+) -> None:
+    variants = _variants(wolfssl)
+    assert variants == {"accept-tls13": {"server"}}
+    for variant, roles in {"default": {"client", "server"}, **variants}.items():
+        # An unsupported group stops the adapter right after option parsing.
+        cmd = [*_base(wolfssl, test_pki, role, variant), "--port=9", "--mtu=1500"]
+        cmd += ["--groups=MLKEM512X25519"]
+        cmd += ["--key-share=default"] if role == "client" else ["--validate=off"]
+        rc, _ = _run_once(cmd)
+        expected = EXIT_UNSUPPORTED if role in roles else EXIT_USAGE
+        assert rc == expected, f"{variant}: rc={rc}"
+
+
+_VALID = {
+    "client": ["--groups", "X25519", "--mtu", "1500", "--key-share", "X25519"],
+    "server": ["--groups", "X25519", "--mtu", "1500", "--validate", "off"],
+}
+
+
+def _space_form_cmd(wolfssl: Implementation, test_pki: pki.TestPki, role: str) -> list[str]:
+    """All required options of a role in the '--opt value' form, minus the role-specific rest."""
+    cmd = [str(wolfssl.adapter), "--role", role, "--variant", "default", "--host", HOST]
+    cmd += ["--port", "9", "--ca", str(test_pki.ca_cert)]
+    if role == "server":
+        cmd += ["--cert", str(test_pki.server_cert), "--key", str(test_pki.server_key)]
+    return cmd
+
+
+def _without(args: list[str], option: str) -> list[str]:
+    i = args.index(option)
+    return args[:i] + args[i + 2 :]
 
 
 @pytest.mark.parametrize(
-    "extra",
+    ("role", "change"),
     [
-        ["--groups", "MLKEM512X25519", "--key-share", "MLKEM512X25519"],
-        ["--groups", "X25519,MLKEM768"],
-        ["--psk-in", "/nonexistent"],
-        ["--no-such-option"],
+        ("client", lambda a: _without(a, "--key-share")),
+        ("server", lambda a: _without(a, "--validate")),
+        ("client", lambda a: _without(a, "--mtu")),
+        ("client", lambda a: [*a, "--no-such-option", "1"]),
+        ("client", lambda a: [*a, "--psk-in", "/nonexistent"]),
+        ("client", lambda a: [*a, "--validate", "off"]),
+        ("server", lambda a: [*a, "--key-share", "X25519"]),
+        ("client", lambda a: [*_without(a, "--mtu"), "--mtu", "abc"]),
+        ("client", lambda a: [*_without(a, "--mtu"), "--mtu", "40"]),
+        ("server", lambda a: [*_without(a, "--validate"), "--validate", "maybe"]),
+        ("client", lambda a: [*_without(a, "--key-share"), "--key-share", "secp256r1"]),
+        ("client", lambda a: [*_without(a, "--groups"), "--groups", "X25519,"]),
+        ("client", lambda a: [*a, "--mtu", "1500"]),
+    ],
+    ids=[
+        "missing-key-share",
+        "missing-validate",
+        "missing-mtu",
+        "unknown-option",
+        "psk-option",
+        "client-gets-validate",
+        "server-gets-key-share",
+        "mtu-not-a-number",
+        "mtu-below-overhead",
+        "bad-validate",
+        "key-share-not-in-groups",
+        "empty-group-entry",
+        "duplicate-option",
     ],
 )
-@pytest.mark.parametrize("role", ["client", "server"])
-def test_unsupported_option_exits_2(
-    wolfssl: Implementation, test_pki: pki.TestPki, role: str, extra: list[str]
+def test_usage_error_exits_64(
+    wolfssl: Implementation, test_pki: pki.TestPki, role: str, change
 ) -> None:
-    # Space-separated form here; run_pair covers --opt=value.
-    cmd = [str(wolfssl.adapter), "--role", role, "--host", HOST, "--port", "9"]
-    if role == "server":
-        cmd += ["--cert", str(test_pki.server_cert), "--key", str(test_pki.server_key)]
-    cmd += ["--ca", str(test_pki.ca_cert), *extra]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    assert proc.returncode == 2, proc.stderr
-    result = _result_line(proc.stdout)
-    assert result is not None
-    assert result["ok"] is False
-    assert "unsupported" in result["error"]
+    rc, result = _run_once(change(_space_form_cmd(wolfssl, test_pki, role) + _VALID[role]))
+    assert rc == EXIT_USAGE
+    assert result is not None and result["ok"] is False and result["error"].startswith("usage:")
+
+
+@pytest.mark.parametrize(
+    "extra", [["--port", "0"], ["--variant", "nope"], ["--variant", "accept-tls13"]]
+)
+def test_bad_client_port_or_variant_exits_64(
+    wolfssl: Implementation, test_pki: pki.TestPki, extra: list[str]
+) -> None:
+    cmd = _space_form_cmd(wolfssl, test_pki, "client") + _VALID["client"]
+    cmd = _without(cmd, extra[0]) + extra
+    assert _run_once(cmd)[0] == EXIT_USAGE
+
+
+@pytest.mark.parametrize("groups", ["MLKEM512X25519", "X25519,MLKEM768"])
+@pytest.mark.parametrize("role", ["client", "server"])
+def test_unsupported_group_exits_2(
+    wolfssl: Implementation, test_pki: pki.TestPki, role: str, groups: str
+) -> None:
+    # Space-separated form: reaching the group check shows that form parses too.
+    cmd = _without(_space_form_cmd(wolfssl, test_pki, role) + _VALID[role], "--groups")
+    cmd += ["--groups", groups]
+    if role == "client":
+        cmd = [*_without(cmd, "--key-share"), "--key-share", "default"]
+    rc, result = _run_once(cmd)
+    assert rc == EXIT_UNSUPPORTED
+    assert result is not None and result["ok"] is False and "unsupported" in result["error"]
 
 
 # --- Fragmented CH1 towards the server --------------------------------------------------------
@@ -299,7 +456,7 @@ def _ch1_splitting_relay(server_port: int) -> Iterator[int]:
     reason="wolfSSL 5.9.4 wolfSSL_accept() processes CH1 statelessly even after "
     "wolfSSL_disable_hrr_cookie() (only wolfSSL_accept_TLSv13() marks the peer stateful when "
     "the cookie is off), so a fragmented CH1 is dropped as 'Cookie probably missing from first "
-    "fragment' (src/ssl_api_hs.c, src/dtls13.c)",
+    "fragment' (src/ssl_api_hs.c, src/dtls13.c); see the accept-tls13 variant",
 )
 def test_server_accepts_fragmented_ch1_without_validation(run_pair) -> None:
     server, client = _args("X25519MLKEM768", 1500, "off")
@@ -307,10 +464,9 @@ def test_server_accepts_fragmented_ch1_without_validation(run_pair) -> None:
     _assert_ok(o, "X25519MLKEM768", hrr=False)
 
 
-def test_server_accepts_fragmented_ch1_without_validation_accept_tls13(run_pair) -> None:
+def test_accept_tls13_variant_accepts_fragmented_ch1_without_validation(run_pair) -> None:
     server, client = _args("X25519MLKEM768", 1500, "off")
-    env = {"DTLS_INTEROP_WOLFSSL_ACCEPT_TLSV13": "1"}
-    o = run_pair(server, client, via=_ch1_splitting_relay, server_env=env)
+    o = run_pair(server, client, via=_ch1_splitting_relay, variant="accept-tls13")
     _assert_ok(o, "X25519MLKEM768", hrr=False)
     first = re.search(r"rx \d+B \| rec=22 epoch=0 hs=1 seq=0 frag=0\+(\d+)/(\d+)", o.server.stderr)
     assert first is not None and int(first[1]) < int(first[2]), o.server.stderr
@@ -318,14 +474,15 @@ def test_server_accepts_fragmented_ch1_without_validation_accept_tls13(run_pair)
 
 @pytest.mark.xfail(
     strict=True,
-    reason="wolfSSL 5.9.4 server with stateless HRR cookie (its DTLS 1.3 default) silently drops "
-    "a fragmented CH1 that has no cookie in its first fragment (src/dtls13.c, "
-    "Dtls13AcceptFragmented / DoClientHelloStateless); the client times out",
+    reason="wolfSSL 5.9.4 server with stateless HRR cookie silently drops a fragmented CH1 that "
+    "has no cookie in its first fragment (src/dtls13.c, DoClientHelloStateless), in both "
+    "variants; the client times out",
 )
-def test_server_accepts_fragmented_ch1_with_cookie(run_pair) -> None:
+@pytest.mark.parametrize("variant", ["default", "accept-tls13"])
+def test_server_accepts_fragmented_ch1_with_cookie(run_pair, variant: str) -> None:
     server, client = _args("X25519MLKEM768", 1500, "cookie")
-    o = run_pair(server, client, via=_ch1_splitting_relay, timeout=HANG_TIMEOUT)
-    _assert_ok(o, "X25519MLKEM768", hrr=True)
+    o = run_pair(server, client, via=_ch1_splitting_relay, timeout=HANG_TIMEOUT, variant=variant)
+    _assert_ok(o, "X25519MLKEM768", hrr=True, cookie=True)
 
 
 def test_relay_split_is_well_formed() -> None:

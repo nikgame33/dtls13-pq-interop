@@ -57,7 +57,7 @@ if [[ ! -f "$STAMP" || "$(cat "$STAMP")" != "$STAMP_CONTENT" ]]; then
     echo "$STAMP_CONTENT" > "$STAMP"
 fi
 
-# The adapter is always rebuilt: the CI cache key covers only build.sh and patches.
+# The adapter is always rebuilt: it takes a second and the library stamp does not cover adapter.c.
 cc -std=c11 -O2 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L \
     -I"$INSTALL/include" -o "$PREFIX/bin/wolfssl-adapter" "$HERE/adapter.c" \
     "$INSTALL/lib/libwolfssl.a" -lm -lpthread
