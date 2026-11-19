@@ -351,7 +351,10 @@ def test_path_factory_routes_client_and_records_trace(tmp_path, layout, test_pki
     ready = json.loads((case_dir(layout, scenario) / "server.stdout").read_text().splitlines()[0])
     assert server_addr == ("127.0.0.1", ready["port"])
     assert f"--port={ready['port']}" not in result.client.command
-    trace = [json.loads(line) for line in (case_dir(layout, scenario) / "trace.jsonl").open()]
+    trace = [
+        json.loads(line)
+        for line in (case_dir(layout, scenario) / "trace.jsonl").read_text().splitlines()
+    ]
     assert trace == [
         {"index": 0, "direction": "c2s", "payload": b"ping".hex()},
         {"index": 1, "direction": "s2c", "payload": b"pong".hex()},
