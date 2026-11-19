@@ -13,10 +13,10 @@ Mark done with `[x]` and add the commit or PR reference.
 
 ## Phase 1: Harness core
 
-- [ ] UDP proxy: forward client<->server on loopback, enforce PMTU (drop oversize), log every datagram with timestamp and direction
-- [ ] DTLS record parser for the trace: DTLSPlaintext and DTLSCiphertext (unified header) records, handshake type, message_seq, fragment offset/length
-- [ ] Impairment rules on parsed records: reorder CH1 fragments, drop the first CH1 fragment once
-- [ ] E2E tests for the proxy with real UDP sockets (no mocks): PMTU drop, reorder, drop-once, trace content
+- [x] UDP proxy: forward client<->server on loopback, enforce PMTU (drop oversize), log every datagram with timestamp and direction (PR #1)
+- [x] DTLS record parser for the trace: DTLSPlaintext and DTLSCiphertext (unified header) records, handshake type, message_seq, fragment offset/length (PR #1)
+- [x] Impairment rules on parsed records: reorder CH1 fragments, drop the first CH1 fragment once (PR #1)
+- [x] E2E tests for the proxy with real UDP sockets (no mocks): PMTU drop, reorder, drop-once, trace content (PR #1)
 - [ ] Runner: start server adapter, wait for readiness, start client, enforce timeout, collect exit code, JSON line, logs, trace
 - [ ] Result schema (JSON per run) and a results directory layout keyed by date, implementation versions and scenario
 - [x] Test PKI generation (ECDSA P-256 CA + leaf), fresh per test session

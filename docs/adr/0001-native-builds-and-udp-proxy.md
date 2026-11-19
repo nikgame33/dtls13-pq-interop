@@ -21,3 +21,9 @@ The proxy drops datagrams above the configured PMTU, can reorder or drop specifi
 - Build reproducibility relies on pinning and checksums instead of container images.
 Containers can be added later for CI caching without changing the adapter interface.
 - Loopback has no real middleboxes; middlebox behaviour has to be modelled in the proxy if needed.
+
+## Proxy semantics (PR #1)
+
+- PMTU is converted to a UDP payload limit with a fixed 48-byte IPv6+UDP overhead, so PMTU 1280 allows 1232-byte datagrams.
+- The PMTU check runs before impairment rules, so an oversize datagram never reaches a rule.
+- The trace has one entry per received datagram, timed when it leaves the proxy or is dropped; reordered datagrams appear with action "delayed".
