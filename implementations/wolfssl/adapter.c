@@ -62,6 +62,8 @@ static const unsigned char HRR_RANDOM[32] = {
 };
 
 static volatile sig_atomic_t g_hrr, g_hrr_cookie, g_hrr_group;
+/* HRR fields are unknown (null) until the handshake has started, e.g. on usage errors. */
+static volatile sig_atomic_t g_handshake_started;
 static int g_is_client;
 
 struct options {
@@ -101,6 +103,8 @@ static void print_json_string(const char *s)
     putchar('"');
 }
 
+static const char *hrr_json(int v) { return g_handshake_started ? json_bool(v) : "null"; }
+
 static void emit_result(int ok, const char *version, const char *group, const char *error)
 {
     fputs("{\"event\": \"result\", \"ok\": ", stdout);
@@ -109,8 +113,8 @@ static void emit_result(int ok, const char *version, const char *group, const ch
     print_json_string(version);
     fputs(", \"group\": ", stdout);
     print_json_string(group);
-    printf(", \"hrr\": %s, \"hrr_cookie\": %s, \"hrr_group\": %s, \"error\": ", json_bool(g_hrr),
-           json_bool(g_hrr_cookie), json_bool(g_hrr_group));
+    printf(", \"hrr\": %s, \"hrr_cookie\": %s, \"hrr_group\": %s, \"error\": ", hrr_json(g_hrr),
+           hrr_json(g_hrr_cookie), hrr_json(g_hrr_group));
     print_json_string(error);
     fputs("}\n", stdout);
     fflush(stdout);
@@ -153,11 +157,11 @@ static void on_deadline(int sig)
     (void)sig;
     /* Async-signal-safe: write(2) of constant strings only. */
     write_str("{\"event\": \"result\", \"ok\": false, \"version\": null, \"group\": null, \"hrr\": ");
-    write_str(json_bool(g_hrr));
+    write_str(hrr_json(g_hrr));
     write_str(", \"hrr_cookie\": ");
-    write_str(json_bool(g_hrr_cookie));
+    write_str(hrr_json(g_hrr_cookie));
     write_str(", \"hrr_group\": ");
-    write_str(json_bool(g_hrr_group));
+    write_str(hrr_json(g_hrr_group));
     write_str(", \"error\": \"timeout\"}\n");
     _exit(EXIT_FAIL);
 }
@@ -560,6 +564,7 @@ _Noreturn static void finish_fail(WOLFSSL *ssl, int ret, const char *what)
 
 static int handshake(WOLFSSL *ssl, int accept_tls13)
 {
+    g_handshake_started = 1;
     for (;;) {
         int ret = g_is_client     ? wolfSSL_connect(ssl)
                   : accept_tls13 ? wolfSSL_accept_TLSv13(ssl)
