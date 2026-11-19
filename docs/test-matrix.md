@@ -37,8 +37,9 @@ Every scenario runs for every (client, server) pair, including same-implementati
 
 ## Recorded per run
 
-- Outcome: pass, fail (with alert / error), unsupported (adapter exit 2), timeout.
-- Datagram trace from the proxy: direction, size, timing, and parsed DTLS record/handshake headers.
+- Outcome: pass, fail (with alert / error), unsupported (adapter exit 2), timeout, error (harness or adapter protocol problem, not a library verdict).
+- Datagram trace from the proxy: direction, size, timing and action per datagram.
+Record and handshake headers are derived with `records.parse_datagram(d.payload)` on each trace entry.
 - CH1/CH2 total size and fragment count.
 - Round trips to completion.
 - Bytes sent by the server before address validation (amplification ratio vs. bytes received).

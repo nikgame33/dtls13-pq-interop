@@ -1,8 +1,9 @@
-"""Discovery of implementation adapters under implementations/<name>/."""
+"""Discovery of implementation adapters under implementations/<name>/, one entry per variant."""
 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,15 @@ BUILD_DIR = REPO_ROOT / ".build"
 # Comma-separated names that MUST be built; set in CI so a broken build fails instead of skipping.
 REQUIRED_ENV = "DTLS_INTEROP_REQUIRE"
 
+DEFAULT_VARIANT = "default"
+VARIANTS_FILE = "variants"
+VARIANT_SEPARATOR = "+"
+CLIENT = "client"
+SERVER = "server"
+BOTH_ROLES = frozenset({CLIENT, SERVER})
+_ROLE_WORDS = {CLIENT: frozenset({CLIENT}), SERVER: frozenset({SERVER}), "both": BOTH_ROLES}
+_VARIANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 
 @dataclass(frozen=True)
 class Implementation:
@@ -20,25 +30,90 @@ class Implementation:
     adapter: Path
     build_script: Path
     prefix: Path
+    variant: str = DEFAULT_VARIANT
+    variant_description: str | None = None
+    # Roles this entry runs in; default entries run in both.
+    roles: frozenset[str] = BOTH_ROLES
+
+    @property
+    def id(self) -> str:
+        """Matrix entry name: `<name>` for the default variant, else `<name>+<variant>`."""
+        if self.variant == DEFAULT_VARIANT:
+            return self.name
+        return f"{self.name}{VARIANT_SEPARATOR}{self.variant}"
 
     @property
     def is_built(self) -> bool:
         return (self.prefix / ".built").is_file()
 
+    @property
+    def version(self) -> str | None:
+        """First line of the .built marker: the pinned upstream version."""
+        try:
+            text = (self.prefix / ".built").read_text().strip()
+        except OSError:
+            return None
+        return text.splitlines()[0] if text else None
 
-def discover() -> list[Implementation]:
-    """All implementations that ship a build.sh."""
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    roles: frozenset[str]
+    description: str
+
+
+def read_variants(path: Path) -> list[Variant]:
+    """Parse a variants file (`ROLE NAME: description` per line); a missing file means none."""
+    if not path.is_file():
+        return []
+    variants: list[Variant] = []
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        head, sep, description = line.partition(":")
+        words, description = head.split(), description.strip()
+        if (
+            not sep
+            or len(words) != 2
+            or words[0] not in _ROLE_WORDS
+            or not _VARIANT_RE.match(words[1])
+            or not description
+        ):
+            raise ValueError(f"{path}:{number}: expected 'ROLE NAME: description', got {line!r}")
+        name = words[1]
+        if name == DEFAULT_VARIANT or any(v.name == name for v in variants):
+            raise ValueError(f"{path}:{number}: duplicate or reserved variant {name!r}")
+        variants.append(Variant(name, _ROLE_WORDS[words[0]], description))
+    return variants
+
+
+def discover(
+    implementations_dir: Path = IMPLEMENTATIONS_DIR, build_dir: Path = BUILD_DIR
+) -> list[Implementation]:
+    """One entry per variant of every implementation that ships a build.sh, default first."""
     found = []
-    for build_script in sorted(IMPLEMENTATIONS_DIR.glob("*/build.sh")):
+    for build_script in sorted(implementations_dir.glob("*/build.sh")):
         name = build_script.parent.name
-        found.append(
-            Implementation(
-                name=name,
-                adapter=build_script.parent / "run",
-                build_script=build_script,
-                prefix=BUILD_DIR / name,
-            )
+        base = Implementation(
+            name=name,
+            adapter=build_script.parent / "run",
+            build_script=build_script,
+            prefix=build_dir / name,
         )
+        found.append(base)
+        for variant in read_variants(build_script.parent / VARIANTS_FILE):
+            found.append(
+                Implementation(
+                    name=name,
+                    adapter=base.adapter,
+                    build_script=build_script,
+                    prefix=base.prefix,
+                    variant=variant.name,
+                    variant_description=variant.description,
+                    roles=variant.roles,
+                )
+            )
     return found
 
 

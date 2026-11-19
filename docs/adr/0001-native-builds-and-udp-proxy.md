@@ -21,3 +21,14 @@ The proxy drops datagrams above the configured PMTU, can reorder or drop specifi
 - Build reproducibility relies on pinning and checksums instead of container images.
 Containers can be added later for CI caching without changing the adapter interface.
 - Loopback has no real middleboxes; middlebox behaviour has to be modelled in the proxy if needed.
+- Libraries that query the kernel for the path MTU see loopback's 65536 bytes, so `--mtu=default` results on loopback are not deployment defaults for them.
+The PMTU limit itself is still enforced by the proxy.
+
+## Proxy semantics (PR #1)
+
+- PMTU is converted to a UDP payload limit with a fixed 48-byte IPv6+UDP overhead, so PMTU 1280 allows 1232-byte datagrams.
+- Rules run first and the PMTU check applies to every datagram the proxy sends, so a rule can split an oversize ClientHello into pieces that fit.
+- The trace has one entry per datagram, timed when it leaves the proxy or is dropped; reordered datagrams appear as "delayed".
+- A datagram a rule replaces appears as "replaced"; each datagram emitted instead has its own index and `origin` pointing to it.
+- `SplitClientHello` renumbers every client epoch 0 record from n to K*n + i (piece i of K), so numbers stay unique and ordered for the server's replay window.
+Server ACKs for epoch 0 are mapped back to the client's numbers, and a split record counts as acknowledged only when all its pieces are.

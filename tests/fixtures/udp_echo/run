@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Test-only adapter: the shim contract over plain UDP (no DTLS), with injectable misbehaviour."""
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+
+EXIT_USAGE = 64
+BEHAVIOURS = (
+    "normal",
+    "never-ready",
+    "ready-no-port",
+    "hang",
+    "exit2",
+    "garbage",
+    "bad-result",
+    "crash",
+    "fail",
+)
+ROLE_OPTIONS = {
+    "client": {"key_share"},
+    "server": {"validate", "cert", "key"},
+}
+COMMON_OPTIONS = {"variant", "host", "port", "groups", "mtu", "ca"}
+RECV_TIMEOUT = 30.0
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(EXIT_USAGE, f"{self.prog}: usage error: {message}\n")
+
+
+class Once(argparse.Action):
+    """Store an option that may appear only once."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest) is not None:
+            parser.error(f"{option_string} given more than once")
+        setattr(namespace, self.dest, values)
+
+
+def role_variants(path, role):
+    """Variant names usable in `role` according to a `ROLE NAME: description` file."""
+    if path is None or not os.path.isfile(path):
+        return set()
+    names = set()
+    with open(path) as f:
+        for line in f:
+            words = line.partition(":")[0].split()
+            if len(words) == 2 and words[0] in (role, "both"):
+                names.add(words[1])
+    return names
+
+
+def name(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise argparse.ArgumentTypeError(f"invalid name {value!r}")
+    return value
+
+
+def mtu(value):
+    if value == "default":
+        return value
+    if not value.isdigit() or int(value) < 576:
+        raise argparse.ArgumentTypeError(f"invalid mtu {value!r}")
+    return int(value)
+
+
+def report(value):
+    key, sep, raw = value.partition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"expected KEY=JSON, got {value!r}")
+    return key, json.loads(raw)
+
+
+def parse_args(parser):
+    parser.add_argument("--role", action=Once, choices=("client", "server"))
+    parser.add_argument("--variant", action=Once, type=name)
+    parser.add_argument("--host", action=Once)
+    parser.add_argument("--port", action=Once, type=int)
+    parser.add_argument("--groups", action=Once)
+    parser.add_argument("--mtu", action=Once, type=mtu)
+    parser.add_argument("--ca", action=Once)
+    parser.add_argument("--key-share", action=Once)
+    parser.add_argument("--validate", action=Once, choices=("off", "cookie"))
+    parser.add_argument("--cert", action=Once)
+    parser.add_argument("--key", action=Once)
+    # Test-only switches, appended by the wrappers the tests install.
+    parser.add_argument("--variants-file", action=Once)
+    parser.add_argument("--behave", choices=BEHAVIOURS, default="normal")
+    parser.add_argument("--spawn-child", action="store_true", help="leave a long-lived grandchild")
+    parser.add_argument("--report", type=report, action="append", default=[], help="KEY=JSON")
+    args = parser.parse_args()
+    if args.role is None:
+        parser.error("--role is required")
+    other = "server" if args.role == "client" else "client"
+    for opt in sorted(COMMON_OPTIONS | ROLE_OPTIONS[args.role]):
+        if getattr(args, opt) is None:
+            parser.error(f"--{opt.replace('_', '-')} is required for {args.role}")
+    for opt in sorted(ROLE_OPTIONS[other]):
+        if getattr(args, opt) is not None:
+            parser.error(f"--{opt.replace('_', '-')} is a {other} option")
+    if args.variant != "default" and args.variant not in role_variants(
+        args.variants_file, args.role
+    ):
+        parser.error(f"--variant={args.variant} is not a {args.role} variant")
+    share = args.key_share
+    if share not in (None, "empty", "default") and share not in args.groups.split(","):
+        parser.error(f"--key-share={share} is not in --groups")
+    return args
+
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def result(args, ok, error=None):
+    fields = {"version": None, "group": None, "hrr": None, "hrr_cookie": None, "hrr_group": None}
+    fields.update(args.report)
+    emit({"event": "result", "ok": ok, **fields, "error": error})
+
+
+def hang():
+    threading.Event().wait()
+
+
+def main():
+    args = parse_args(Parser())
+    print(f"pid={os.getpid()} variant={args.variant}", file=sys.stderr, flush=True)
+    if args.spawn_child:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"])
+        print(f"child-pid={child.pid}", file=sys.stderr, flush=True)
+
+    if args.behave == "exit2":
+        result(args, False, f"{args.role}: configuration not supported")
+        return 2
+    if args.behave == "garbage":
+        print("this is not JSON", flush=True)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(RECV_TIMEOUT)
+    if args.role == "server":
+        sock.bind((args.host, args.port))
+        if args.behave == "never-ready":
+            hang()
+        if args.behave == "ready-no-port":
+            emit({"event": "ready"})
+            hang()
+        emit({"event": "ready", "port": sock.getsockname()[1]})
+        if args.behave == "hang":
+            hang()
+        data, peer = sock.recvfrom(2048)
+        if args.behave == "crash":
+            os.kill(os.getpid(), signal.SIGKILL)
+        if data != b"ping":
+            result(args, False, f"unexpected payload {data!r}")
+            return 1
+        sock.sendto(b"pong", peer)
+    else:
+        if args.behave == "hang":
+            hang()
+        sock.connect((args.host, args.port))
+        sock.send(b"ping")
+        data = sock.recv(2048)
+        if args.behave == "crash":
+            os.kill(os.getpid(), signal.SIGKILL)
+        if data != b"pong":
+            result(args, False, f"unexpected payload {data!r}")
+            return 1
+
+    if args.behave == "fail":
+        result(args, False, "simulated handshake failure")
+        return 1
+    if args.behave == "bad-result":
+        emit({"event": "result", "ok": True})
+        return 0
+    result(args, True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

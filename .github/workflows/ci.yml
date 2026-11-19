@@ -55,7 +55,10 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: .build/${{ matrix.name }}
-          key: build-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles(format('implementations/{0}/build.sh', matrix.name), format('implementations/{0}/*.patch', matrix.name)) }}
+          # Exact hit needs unchanged adapter sources; the prefix restores the library build.
+          key: build-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles(format('implementations/{0}/build.sh', matrix.name), format('implementations/{0}/*.patch', matrix.name)) }}-${{ hashFiles(format('implementations/{0}/**', matrix.name)) }}
+          restore-keys: |
+            build-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles(format('implementations/{0}/build.sh', matrix.name), format('implementations/{0}/*.patch', matrix.name)) }}-
       - name: Install system packages
         run: |
           f=implementations/${{ matrix.name }}/apt-packages.txt
