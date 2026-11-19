@@ -17,9 +17,12 @@ Mark done with `[x]` and add the commit or PR reference.
 - [x] DTLS record parser for the trace: DTLSPlaintext and DTLSCiphertext (unified header) records, handshake type, message_seq, fragment offset/length (PR #1)
 - [x] Impairment rules on parsed records: reorder CH1 fragments, drop the first CH1 fragment once (PR #1)
 - [x] E2E tests for the proxy with real UDP sockets (no mocks): PMTU drop, reorder, drop-once, trace content (PR #1)
+- [ ] Proxy rule that splits an unfragmented CH1 into fragments (wolfSSL clients never fragment CH1)
 - [ ] Runner: start server adapter, wait for readiness, start client, enforce timeout, collect exit code, JSON line, logs, trace
 - [ ] Result schema (JSON per run) and a results directory layout keyed by date, implementation versions and scenario
 - [x] Test PKI generation (ECDSA P-256 CA + leaf), fresh per test session
+
+- [ ] Conformance suite `tests/conformance/`: every rule of docs/shim-interface.md against every built implementation and variant (ADR 0002)
 
 ## Phase 2: Implementations
 
