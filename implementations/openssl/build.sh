@@ -41,4 +41,5 @@ cc -std=c11 -O2 -Wall -Wextra -Werror -I"$PREFIX/include" \
     "$PREFIX/lib/libssl.a" "$PREFIX/lib/libcrypto.a" -lpthread -ldl
 
 "$PREFIX/bin/openssl" version >&2
-touch "$OUT/.built"
+# The runner reads the pinned version from the first line.
+printf 'openssl %s\nconfigure: %s\n' "$VERSION" "${CONFIGURE_FLAGS[*]}" >"$OUT/.built"

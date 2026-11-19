@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import select
 import socket
 import subprocess
@@ -16,6 +17,7 @@ from dtls_interop import pki
 
 TIMEOUT = 20.0
 HOST = "127.0.0.1"
+IP_UDP_OVERHEAD = 48  # --mtu is the IP path MTU; the contract reserves IPv6 + UDP headers
 
 
 @dataclass
@@ -49,16 +51,17 @@ class Adapters:
         self.procs: list[subprocess.Popen[str]] = []
 
     def _args(self, role: str, groups: str, extra: list[str]) -> list[str]:
-        args = [str(self.adapter), "--role", role, "--host", HOST, "--port", str(self.port)]
-        args += ["--groups", groups, *extra]
+        """Same --opt=value syntax and role-specific flags as the runner."""
+        args = [str(self.adapter), f"--role={role}", f"--host={HOST}", f"--port={self.port}"]
+        args += [f"--groups={groups}", *extra, f"--ca={self.pki.ca_cert}"]
         if role == "server":
-            return [*args, "--cert", str(self.pki.server_cert), "--key", str(self.pki.server_key)]
-        return [*args, "--ca", str(self.pki.ca_cert)]
+            return [*args, f"--cert={self.pki.server_cert}", f"--key={self.pki.server_key}"]
+        return args
 
     def start_server(self, groups: str, *extra: str, cert: pki.TestPki | None = None) -> Server:
         args = self._args("server", groups, list(extra))
         if cert is not None:
-            args += ["--cert", str(cert.server_cert), "--key", str(cert.server_key)]
+            args += [f"--cert={cert.server_cert}", f"--key={cert.server_key}"]
         stderr = self.tmp_path / f"server-{len(self.procs)}.log"
         with stderr.open("w") as err:
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=err, text=True)
@@ -127,8 +130,19 @@ def _ch_records(server: Run) -> int:
     return server.stderr.count("<< plaintext handshake record")
 
 
+def _datagrams(run: Run) -> list[int]:
+    """Sizes of all UDP datagrams the adapter sent."""
+    return [int(n) for n in re.findall(r"^>> datagram \((\d+) bytes\)$", run.stderr, re.M)]
+
+
+def _assert_fits(run: Run, mtu: int) -> None:
+    sizes = _datagrams(run)
+    assert sizes, run.stderr
+    assert max(sizes) <= mtu - IP_UDP_OVERHEAD, sizes
+
+
 def test_x25519_self_interop(adapters: Adapters) -> None:
-    """S01: X25519, full share, PMTU 1500, no validation."""
+    """S01: X25519, full share, PMTU 1500, no validation; options given as "--opt value"."""
     common = ["--mtu", "1500"]
     cli, srv = _handshake(
         adapters,
@@ -141,39 +155,41 @@ def test_x25519_self_interop(adapters: Adapters) -> None:
     _assert_ok(srv, "X25519", hrr=False)
 
 
-@pytest.mark.parametrize("mtu", [1500, 1200], ids=["S02-unfragmented", "S03-fragmented-CH1"])
+@pytest.mark.parametrize("mtu", [1500, 1280], ids=["S02-unfragmented", "S03-fragmented-CH1"])
 def test_x25519mlkem768_self_interop(adapters: Adapters, mtu: int) -> None:
-    common = ["--mtu", str(mtu)]
     cli, srv = _handshake(
         adapters,
         "X25519MLKEM768",
         "X25519MLKEM768",
-        server=[*common, "--validate", "off"],
-        client=[*common, "--key-share", "X25519MLKEM768"],
+        server=[f"--mtu={mtu}", "--validate=off"],
+        client=[f"--mtu={mtu}", "--key-share=X25519MLKEM768"],
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=False)
     _assert_ok(srv, "X25519MLKEM768", hrr=False)
     assert cli.stderr.count(">> ClientHello") == 1, cli.stderr
-    # CH1 is about 1410 bytes, so it fits one record at 1500 and needs two at 1200.
+    # The CH1 record is 1422 bytes: one datagram within 1452 (1500 - 48), two within 1232.
     assert _ch_records(srv) == (1 if mtu == 1500 else 2), srv.stderr
+    _assert_fits(cli, mtu)
+    _assert_fits(srv, mtu)
 
 
-@pytest.mark.parametrize("mtu", [1500, 1200], ids=["unfragmented", "S04-fragmented-CH1"])
+@pytest.mark.parametrize("mtu", [1500, 1280], ids=["unfragmented", "S04-fragmented-CH1"])
 def test_cookie_validation_x25519mlkem768(adapters: Adapters, mtu: int) -> None:
     """The listener's stateless HRR cookie is a real HRR, so both sides report hrr=true."""
-    common = ["--mtu", str(mtu)]
     cli, srv = _handshake(
         adapters,
         "X25519MLKEM768",
         "X25519MLKEM768",
-        server=[*common, "--validate", "cookie"],
-        client=[*common, "--key-share", "X25519MLKEM768"],
+        server=[f"--mtu={mtu}", "--validate=cookie"],
+        client=[f"--mtu={mtu}", "--key-share=X25519MLKEM768"],
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=True)
     _assert_ok(srv, "X25519MLKEM768", hrr=True)
     assert cli.stderr.count(">> ClientHello") == 2, cli.stderr
     # The 140-byte cookie grows CH2 to about 1555 bytes, so CH2 is fragmented even at 1500.
     assert _ch_records(srv) == (1 + 2 if mtu == 1500 else 2 + 2), srv.stderr
+    _assert_fits(cli, mtu)
+    _assert_fits(srv, mtu)
 
 
 def test_wrong_guess_triggers_hrr(adapters: Adapters) -> None:
@@ -182,8 +198,8 @@ def test_wrong_guess_triggers_hrr(adapters: Adapters) -> None:
         adapters,
         "X25519MLKEM768",
         "X25519MLKEM768,X25519",
-        server=["--mtu", "1200", "--validate", "off"],
-        client=["--mtu", "1200", "--key-share", "X25519"],
+        server=["--mtu=1280", "--validate=off"],
+        client=["--mtu=1280", "--key-share=X25519"],
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=True)
     _assert_ok(srv, "X25519MLKEM768", hrr=True)
@@ -195,8 +211,8 @@ def test_server_preference_order(adapters: Adapters) -> None:
         adapters,
         "X25519MLKEM768,X25519",
         "X25519,X25519MLKEM768",
-        server=["--mtu", "1500", "--validate", "off"],
-        client=["--mtu", "1500", "--key-share", "X25519"],
+        server=["--mtu=1500", "--validate=off"],
+        client=["--mtu=1500", "--key-share=X25519"],
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=True)
     _assert_ok(srv, "X25519MLKEM768", hrr=True)
@@ -206,7 +222,7 @@ def test_listener_default_mtu_is_minimum(adapters: Adapters) -> None:
     """Without --mtu, IP_MTU fails on the unconnected listener socket and OpenSSL falls back to
     its 256-byte link minimum, so the ServerHello is cut into 214-byte records."""
     cli, srv = _handshake(
-        adapters, "X25519MLKEM768", "X25519MLKEM768", server=["--validate", "off"], client=[]
+        adapters, "X25519MLKEM768", "X25519MLKEM768", server=["--validate=off"], client=[]
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=False)
     _assert_ok(srv, "X25519MLKEM768", hrr=False)
@@ -214,6 +230,7 @@ def test_listener_default_mtu_is_minimum(adapters: Adapters) -> None:
     assert sent == [">> plaintext handshake record (214 bytes)"] * 5 + [
         ">> plaintext handshake record (176 bytes)"
     ], srv.stderr
+    assert max(_datagrams(srv)) == 228, srv.stderr
 
 
 @pytest.mark.xfail(
@@ -224,14 +241,14 @@ def test_listener_default_mtu_is_minimum(adapters: Adapters) -> None:
 )
 def test_empty_key_share_triggers_hrr(adapters: Adapters) -> None:
     """S05 with an OpenSSL client; the client is checked first so the xfail does not wait."""
-    srv = adapters.start_server("X25519MLKEM768", "--mtu", "1500", "--validate", "off")
-    cli = adapters.run_client("X25519MLKEM768", "--mtu", "1500", "--key-share", "empty")
+    srv = adapters.start_server("X25519MLKEM768", "--mtu=1500", "--validate=off")
+    cli = adapters.run_client("X25519MLKEM768", "--mtu=1500", "--key-share=empty")
     _assert_ok(cli, "X25519MLKEM768", hrr=True)
     _assert_ok(srv.finish(), "X25519MLKEM768", hrr=True)
 
 
 def test_empty_key_share_reported_unsupported(adapters: Adapters) -> None:
-    cli = adapters.run_client("X25519MLKEM768", "--key-share", "empty")
+    cli = adapters.run_client("X25519MLKEM768", "--key-share=empty")
     assert cli.code == 2, cli.stderr
     assert cli.result["ok"] is False
     assert "empty key_share" in cli.result["error"]
@@ -240,7 +257,7 @@ def test_empty_key_share_reported_unsupported(adapters: Adapters) -> None:
 @pytest.mark.parametrize("role", ["client", "server"])
 def test_unimplemented_group_is_unsupported(adapters: Adapters, role: str) -> None:
     """MLKEM512X25519 (draft-rosomakho-tls-ecdhe-mlkem512) is not in OpenSSL 4.1.0."""
-    args = adapters._args(role, "MLKEM512X25519,X25519", ["--mtu", "1280"])
+    args = adapters._args(role, "MLKEM512X25519,X25519", ["--mtu=1280"])
     proc = subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT)
     result = _result(proc.stdout)
     assert proc.returncode == 2, proc.stderr
@@ -256,10 +273,19 @@ def test_unimplemented_group_is_unsupported(adapters: Adapters, role: str) -> No
     assert '"ready"' not in proc.stdout
 
 
+@pytest.mark.parametrize("role", ["client", "server"])
+def test_mtu_below_library_minimum_is_unsupported(adapters: Adapters, role: str) -> None:
+    """--mtu=200 leaves 152 bytes of payload, below what SSL_set_mtu accepts."""
+    args = adapters._args(role, "X25519", ["--mtu=200"])
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=TIMEOUT)
+    assert proc.returncode == 2, proc.stderr
+    assert "--mtu 200 rejected" in _result(proc.stdout)["error"]
+
+
 def test_client_rejects_untrusted_server(adapters: Adapters, tmp_path: Path) -> None:
     other = pki.generate(tmp_path / "other-pki")
-    srv = adapters.start_server("X25519", "--mtu", "1500", cert=other)
-    cli = adapters.run_client("X25519", "--mtu", "1500")
+    srv = adapters.start_server("X25519", "--mtu=1500", cert=other)
+    cli = adapters.run_client("X25519", "--mtu=1500")
     assert cli.code == 1, cli.stderr
     assert cli.result["ok"] is False
     assert "certificate verify failed" in cli.result["error"]
@@ -267,16 +293,16 @@ def test_client_rejects_untrusted_server(adapters: Adapters, tmp_path: Path) -> 
 
 
 def test_psk_resumption_after_hrr(adapters: Adapters, tmp_path: Path) -> None:
-    """S10-like: ticket from a cookie-validated handshake at MTU 1200, resumed in a new process."""
+    """S10-like: ticket from a cookie-validated handshake at MTU 1280, resumed in a new process."""
     keys, session = tmp_path / "ticket-keys.bin", tmp_path / "session.pem"
-    server = ["--mtu", "1200", "--validate", "cookie"]
-    client = ["--mtu", "1200", "--key-share", "X25519MLKEM768"]
+    server = ["--mtu=1280", "--validate=cookie"]
+    client = ["--mtu=1280", "--key-share=X25519MLKEM768"]
     cli, srv = _handshake(
         adapters,
         "X25519MLKEM768",
         "X25519MLKEM768",
-        server=[*server, "--psk-out", str(keys)],
-        client=[*client, "--psk-out", str(session)],
+        server=[*server, f"--psk-out={keys}"],
+        client=[*client, f"--psk-out={session}"],
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=True)
     _assert_ok(srv, "X25519MLKEM768", hrr=True)
@@ -286,8 +312,8 @@ def test_psk_resumption_after_hrr(adapters: Adapters, tmp_path: Path) -> None:
         adapters,
         "X25519MLKEM768",
         "X25519MLKEM768",
-        server=[*server, "--psk-in", str(keys)],
-        client=[*client, "--psk-in", str(session)],
+        server=[*server, f"--psk-in={keys}"],
+        client=[*client, f"--psk-in={session}"],
     )
     _assert_ok(cli, "X25519MLKEM768", hrr=True)
     _assert_ok(srv, "X25519MLKEM768", hrr=True)

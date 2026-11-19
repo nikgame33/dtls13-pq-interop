@@ -23,6 +23,8 @@ enum { EXIT_OK = 0, EXIT_FAIL = 1, EXIT_UNSUPPORTED = 2 };
 #define TICKET_KEYS_LEN 80
 #define MAX_GROUPS 16
 #define LINGER_SECONDS 2
+/* --mtu is the IP path MTU; the contract reserves IPv6 + UDP headers for every address family. */
+#define IP_UDP_OVERHEAD 48
 
 struct options {
     const char *role;
@@ -37,6 +39,7 @@ struct options {
     const char *psk_in;
     const char *psk_out;
     long mtu;
+    long payload; /* largest UDP payload: mtu - IP_UDP_OVERHEAD, or 0 if --mtu is absent */
 };
 
 static const struct options *g_opts;
@@ -189,18 +192,42 @@ static void msg_cb(int write_p, int version, int content_type, const void *buf, 
         hrr ? "HelloRetryRequest" : hs_name(p[0]), len);
 }
 
+/* SSL_set_mtu takes the UDP payload size (DTLS_set_link_mtu would subtract only 28 on IPv4). */
+static bool set_mtu(SSL *ssl)
+{
+    if (g_opts->payload == 0)
+        return true;
+    SSL_set_options(ssl, SSL_OP_NO_QUERY_MTU);
+    return SSL_set_mtu(ssl, g_opts->payload) > 0;
+}
+
 /* Listener connections are created internally, so per-connection MTU is set once CH1 arrives. */
 static int client_hello_cb(SSL *ssl, int *alert, void *arg)
 {
     (void)arg;
-    if (g_opts->mtu > 0) {
-        SSL_set_options(ssl, SSL_OP_NO_QUERY_MTU);
-        if (!SSL_set_mtu(ssl, g_opts->mtu)) {
-            *alert = SSL_AD_INTERNAL_ERROR;
-            return SSL_CLIENT_HELLO_ERROR;
-        }
+    if (!set_mtu(ssl)) {
+        *alert = SSL_AD_INTERNAL_ERROR;
+        return SSL_CLIENT_HELLO_ERROR;
     }
     return SSL_CLIENT_HELLO_SUCCESS;
+}
+
+/* Logs every UDP datagram sent: BIO_write on the client, BIO_sendmmsg from listener connections. */
+static long datagram_cb(BIO *b, int oper, const char *argp, size_t len, int argi, long argl,
+    int ret, size_t *processed)
+{
+    (void)b, (void)len, (void)argi, (void)argl;
+    if (oper == (BIO_CB_WRITE | BIO_CB_RETURN) && ret > 0) {
+        fprintf(stderr, ">> datagram (%zu bytes)\n", *processed);
+    } else if (oper == (BIO_CB_SENDMMSG | BIO_CB_RETURN) && ret > 0) {
+        const BIO_MMSG_CB_ARGS *args = (const BIO_MMSG_CB_ARGS *)argp;
+
+        for (size_t i = 0; i < *args->msgs_processed; i++) {
+            const BIO_MSG *m = (const BIO_MSG *)((const char *)args->msg + i * args->stride);
+            fprintf(stderr, ">> datagram (%zu bytes)\n", m->data_len);
+        }
+    }
+    return ret;
 }
 
 static int new_session_cb(SSL *ssl, SSL_SESSION *sess)
@@ -320,12 +347,11 @@ static int run_client(SSL_CTX *ctx)
     ssl = SSL_new(ctx);
     if (bio == NULL || ssl == NULL)
         return fail_ssl(NULL, 0, "creating connection");
+    BIO_set_callback_ex(bio, datagram_cb);
     SSL_set_bio(ssl, bio, bio);
-    if (g_opts->mtu > 0) {
-        SSL_set_options(ssl, SSL_OP_NO_QUERY_MTU);
-        if (!SSL_set_mtu(ssl, g_opts->mtu))
-            return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu %ld rejected by SSL_set_mtu", g_opts->mtu);
-    }
+    if (!set_mtu(ssl))
+        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu %ld rejected by SSL_set_mtu(%ld)",
+            g_opts->mtu, g_opts->payload);
     if (!SSL_set1_dnsname(ssl, SERVER_NAME) || !SSL_set_tlsext_host_name(ssl, SERVER_NAME))
         return fail_ssl(ssl, 0, "setting server name");
     if (g_opts->psk_in != NULL) {
@@ -438,8 +464,9 @@ static int run_server(SSL_CTX *ctx)
         return rc;
     /* Reject an MTU the library refuses before announcing readiness. */
     probe = SSL_new(ctx);
-    if (probe == NULL || (g_opts->mtu > 0 && !SSL_set_mtu(probe, g_opts->mtu)))
-        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu %ld rejected by SSL_set_mtu", g_opts->mtu);
+    if (probe == NULL || !set_mtu(probe))
+        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu %ld rejected by SSL_set_mtu(%ld)",
+            g_opts->mtu, g_opts->payload);
     SSL_free(probe);
     SSL_CTX_set_client_hello_cb(ctx, client_hello_cb, NULL);
 
@@ -459,10 +486,11 @@ static int run_server(SSL_CTX *ctx)
     listener = SSL_new_listener(ctx, flags);
     if (bio == NULL || listener == NULL)
         return fail_ssl(NULL, 0, "creating DTLS listener");
+    BIO_set_callback_ex(bio, datagram_cb);
     SSL_set_bio(listener, bio, bio);
-    if (g_opts->mtu > 2000
+    if (g_opts->payload > 2000
         && !SSL_set_generic_value_uint(listener, SSL_VALUE_DTLS_LISTENER_MAX_DGRAM_SIZE,
-            (uint64_t)g_opts->mtu))
+            (uint64_t)g_opts->payload))
         return fail_ssl(NULL, 0, "raising listener datagram size");
     if (SSL_listen(listener) != 1)
         return fail_ssl(NULL, 0, "SSL_listen");
@@ -540,8 +568,9 @@ int main(int argc, char **argv)
         case 'o': o.psk_out = optarg; break;
         case 'm':
             o.mtu = strtol(optarg, &end, 10);
-            if (*end != '\0' || o.mtu <= 0)
-                return usage("--mtu must be a positive integer");
+            if (*end != '\0' || o.mtu <= IP_UDP_OVERHEAD)
+                return usage("--mtu must be an integer above 48 (IPv6 + UDP headers)");
+            o.payload = o.mtu - IP_UDP_OVERHEAD;
             break;
         default: return usage("unknown option");
         }
