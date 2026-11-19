@@ -112,6 +112,8 @@ The runner starts the client only after this line.
 | `error` | Short error string from the library on failure |
 
 Fields the adapter cannot determine are `null`, never guessed; `hrr_cookie` and `hrr_group` are `false` when `hrr` is `false`.
+Before the handshake has started (usage error, unsupported configuration) `version`, `group`, `hrr`, `hrr_cookie` and `hrr_group` are `null`.
+Every exit, including exit 2 and 64, prints a result line with `ok` false and `error` set; the runner falls back to the last stderr line if it is missing.
 An adapter may get these values from the library API or by parsing the plaintext handshake records it sends and receives.
 
 ## Exit codes
@@ -121,7 +123,7 @@ An adapter may get these values from the library API or by parsing the plaintext
 | 0 | Handshake and echo succeeded | pass (if expectations hold) |
 | 1 | Failure (handshake error, alert, wrong echo) | fail |
 | 2 | Configuration not supported by this implementation | unsupported |
-| 64 | Usage error (missing, unknown or malformed option) | error |
+| 64 | Usage error (see Run: missing, unknown, repeated or other-role option, malformed value, variant not listed for the role) | error |
 
 ## System packages
 
