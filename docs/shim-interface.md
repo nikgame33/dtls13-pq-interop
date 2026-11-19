@@ -37,14 +37,16 @@ run --role=client|server
 
 Every option listed for a role is required; there are no implicit defaults.
 The value `default` means "do not configure this, let the library decide", so library defaults are measured explicitly.
-A missing option, an unknown option, an option of the other role or a malformed value is a usage error (exit 64).
+A missing, unknown, repeated or other-role option, or a malformed value, is a usage error (exit 64).
+A `--key-share` group that is not in `--groups` counts as malformed.
 The runner passes every option as `--opt=value`; adapters must accept that form and should also accept `--opt value`.
 
 ### Variants
 
 A library code path the adapter can choose between is a variant, never an environment variable or a compile-time switch of the adapter.
-`implementations/<name>/variants` lists the non-default variants, one per line as `NAME: one-sentence description`; the file is optional.
-The matrix runs every variant as its own entry, named `<name>+<variant>` (e.g. `wolfssl+accept-tls13`), and records the variant in each result.
+`implementations/<name>/variants` lists the non-default variants, one per line as `ROLE NAME: one-sentence description`, where ROLE is `client`, `server` or `both`; the file is optional.
+The matrix runs every variant as its own entry, named `<name>+<variant>` (e.g. `wolfssl+accept-tls13`), only in the roles it lists, and records the variant in each result.
+An adapter accepts `--variant=default` in both roles and a listed variant only in its roles; anything else is a usage error.
 Each implementation's README documents what every variant changes.
 
 ### Groups

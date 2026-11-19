@@ -21,6 +21,8 @@ The proxy drops datagrams above the configured PMTU, can reorder or drop specifi
 - Build reproducibility relies on pinning and checksums instead of container images.
 Containers can be added later for CI caching without changing the adapter interface.
 - Loopback has no real middleboxes; middlebox behaviour has to be modelled in the proxy if needed.
+- Libraries that query the kernel for the path MTU see loopback's 65536 bytes, so `--mtu=default` results on loopback are not deployment defaults for them.
+The PMTU limit itself is still enforced by the proxy.
 
 ## Proxy semantics (PR #1)
 
