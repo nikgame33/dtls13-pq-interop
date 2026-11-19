@@ -41,8 +41,8 @@ def test_list(impl_root, module):
 
     assert proc.returncode == 0, proc.stderr
     lines = proc.stdout.splitlines()
-    assert f"  echo-a       built ({ECHO_VERSION})" in lines
-    assert "  echo-unbuilt not built" in lines
+    assert f"  echo-a        built ({ECHO_VERSION})" in lines
+    assert "  echo-unbuilt  not built" in lines
     assert "  S01  X25519, full share, PMTU 1500, no validation" in lines
     assert any(line.startswith("  T01  ") for line in lines)
 
@@ -133,3 +133,41 @@ def test_run_requires_scenario(impl_root):
 
     assert proc.returncode == 2
     assert "--scenario" in proc.stderr
+
+
+def test_variants_are_listed_and_selectable(impl_root, tmp_path):
+    install(impl_root, "echo-v", variants="alt: Alternative code path\n\nslow: Slow path\n")
+    listing = cli(impl_root, "list")
+
+    assert listing.returncode == 0, listing.stderr
+    assert f"  echo-v+alt    built ({ECHO_VERSION})  variant: Alternative code path" in (
+        listing.stdout.splitlines()
+    )
+    assert "  echo-v+slow   built" in listing.stdout
+
+    results = tmp_path / "results"
+    proc = cli(
+        impl_root,
+        "run",
+        "--scenario=S01",
+        "--client=echo-v+alt",
+        "--server=echo-v,echo-v+slow",
+        f"--results-dir={results}",
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "S01  echo-v+alt__echo-v+slow  pass" in proc.stdout
+    [run_dir] = run_dirs(results)
+    cases = read_run(run_dir)
+    assert [(c.client.variant, c.server.variant) for c in cases] == [
+        ("alt", "default"),
+        ("alt", "slow"),
+    ]
+
+
+def test_malformed_variants_file_is_usage_error(impl_root):
+    install(impl_root, "echo-bad", variants="no description here\n")
+    proc = cli(impl_root, "list")
+
+    assert proc.returncode == 2
+    assert "expected 'NAME: description'" in proc.stderr

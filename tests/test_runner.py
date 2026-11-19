@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from echo_adapter import ECHO_VERSION, child_pids, install, pid_alive
 
-from dtls_interop import runner, scenarios
+from dtls_interop import implementations, runner, scenarios
 from dtls_interop.results import (
     RESULT_FILE,
     SCHEMA_VERSION,
@@ -72,12 +72,35 @@ def test_pass_records_everything(tmp_path, layout, test_pki):
             "version": None,
             "group": None,
             "hrr": None,
+            "hrr_cookie": None,
+            "hrr_group": None,
             "error": None,
         }
+        assert side.variant == "default"
         assert side.duration_s is not None and side.duration_s >= 0
-    assert "--role=server" in result.server.command
-    assert "--validate=off" in result.server.command
-    assert "--key-share=X25519" in result.client.command
+    assert result.server.command[1:] == [
+        "--role=server",
+        "--variant=default",
+        "--host=127.0.0.1",
+        "--port=0",
+        "--groups=X25519",
+        "--mtu=1500",
+        f"--ca={test_pki.ca_cert}",
+        "--validate=off",
+        f"--cert={test_pki.server_cert}",
+        f"--key={test_pki.server_key}",
+    ]
+    ready = json.loads((case_dir(layout) / "server.stdout").read_text().splitlines()[0])
+    assert result.client.command[1:] == [
+        "--role=client",
+        "--variant=default",
+        "--host=127.0.0.1",
+        f"--port={ready['port']}",
+        "--groups=X25519",
+        "--mtu=1500",
+        f"--ca={test_pki.ca_cert}",
+        "--key-share=X25519",
+    ]
     assert result.path.proxied is False
     assert result.path.pmtu == 1500
     assert result.trace is None
@@ -200,7 +223,7 @@ def test_server_crash_is_fail(tmp_path, layout, test_pki):
 
 
 def test_reported_group_mismatch_is_fail(tmp_path, layout, test_pki):
-    result = run(tmp_path, layout, test_pki, server_flags=["--report-group=X25519MLKEM768"])
+    result = run(tmp_path, layout, test_pki, server_flags=['--report=group="X25519MLKEM768"'])
 
     assert result.outcome is Outcome.FAIL
     assert result.reason == "server reported group='X25519MLKEM768', expected 'X25519'"
@@ -324,8 +347,9 @@ def test_path_factory_routes_client_and_records_trace(tmp_path, layout, test_pki
     assert result.path.impairments == [str(Impairment.REORDER_CH1)]
     [(server_addr, conditions)] = seen
     assert conditions == scenario.path
-    assert f"--port={server_addr[1]}" in result.server.command
-    assert f"--port={server_addr[1]}" not in result.client.command
+    ready = json.loads((case_dir(layout, scenario) / "server.stdout").read_text().splitlines()[0])
+    assert server_addr == ("127.0.0.1", ready["port"])
+    assert f"--port={ready['port']}" not in result.client.command
     trace = [json.loads(line) for line in (case_dir(layout, scenario) / "trace.jsonl").open()]
     assert trace == [
         {"index": 0, "direction": "c2s", "payload": b"ping".hex()},
@@ -343,10 +367,79 @@ def test_path_factory_refusal_is_error(tmp_path, layout, test_pki):
     assert result.outcome is Outcome.ERROR
     assert result.reason == "path setup failed: unknown impairment 'reorder-ch1'"
     assert result.path.proxied is False
-    assert not result.server.started
+    # The path is set up once the server has reported its port, so the server ran and was killed.
+    assert result.server.killed
+    assert not result.client.started
 
 
-def test_free_udp_port_is_bindable():
-    port = runner.free_udp_port()
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind(("127.0.0.1", port))
+def test_usage_error(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, client_flags=["--bogus=1"], server_grace=0.5)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason.startswith("usage error (client): ")
+    assert "unrecognized arguments: --bogus=1" in result.reason
+    assert result.client.exit_code == 64
+
+
+def test_ready_line_without_port_is_error(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, server_flags=["--behave=ready-no-port"])
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason == "server: ready line without a valid port: {'event': 'ready'}"
+    assert result.server.killed
+    assert not result.client.started
+
+
+@pytest.mark.parametrize(
+    ("report", "reason"),
+    [
+        (
+            ["--report=hrr=false", "--report=hrr_cookie=true"],
+            "server: result 'hrr_cookie' must be false when 'hrr' is false",
+        ),
+        (
+            ["--report=hrr=false", "--report=hrr_cookie=false"],
+            "server: result 'hrr_group' must be false when 'hrr' is false",
+        ),
+        (["--report=hrr_group=1"], "server: result 'hrr_group' has wrong type: 1"),
+    ],
+)
+def test_hrr_reason_fields_are_validated(tmp_path, layout, test_pki, report, reason):
+    result = run(tmp_path, layout, test_pki, server_flags=report)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason == reason
+
+
+def test_hrr_reason_expectations(tmp_path, layout, test_pki):
+    # S04 expects an HRR that carries a cookie and does not ask for a new key share.
+    s04 = scenarios.get("S04")
+    report = ["--report=hrr=true", "--report=hrr_cookie=false", "--report=hrr_group=true"]
+    result = run(tmp_path, layout, test_pki, server_flags=report, scenario=s04)
+
+    assert result.outcome is Outcome.FAIL
+    assert result.reason == (
+        "server reported hrr_cookie=False, expected True; "
+        "server reported hrr_group=True, expected False"
+    )
+    assert "--validate=cookie" in result.server.command
+    assert "--mtu=1280" in result.server.command
+
+
+def test_variant_is_passed_and_recorded(tmp_path, layout, test_pki):
+    install(tmp_path, "echo", variants="fast: skips nothing\n")
+    found = implementations.discover(tmp_path / "implementations", tmp_path / "build")
+    entries = {i.id: i for i in found}
+    client, server = entries["echo+fast"], entries["echo"]
+
+    result = runner.run_case(S01, client, server, layout=layout, pki=test_pki, **OK_LIMITS)
+
+    assert result.outcome is Outcome.PASS, result.reason
+    assert (result.client.implementation, result.client.variant) == ("echo", "fast")
+    assert (result.server.implementation, result.server.variant) == ("echo", "default")
+    assert "--variant=fast" in result.client.command
+    assert "--variant=default" in result.server.command
+    d = layout.case_dir("S01", "echo+fast", "echo")
+    assert d.name == "echo+fast__echo"
+    assert "variant=fast" in (d / "client.stderr").read_text()
+    assert read_result(d / RESULT_FILE) == result

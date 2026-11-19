@@ -43,8 +43,12 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="scenario ID, repeatable or comma-separated; 'all' for every scenario",
     )
-    run.add_argument("--client", action="append", help="client implementation (default: all built)")
-    run.add_argument("--server", action="append", help="server implementation (default: all built)")
+    run.add_argument(
+        "--client", action="append", help="NAME or NAME+VARIANT, repeatable (default: all built)"
+    )
+    run.add_argument(
+        "--server", action="append", help="NAME or NAME+VARIANT, repeatable (default: all built)"
+    )
     run.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     run.add_argument("--ready-timeout", type=float, default=runner.DEFAULT_READY_TIMEOUT)
     run.add_argument("--timeout", type=float, default=runner.DEFAULT_CASE_TIMEOUT)
@@ -60,10 +64,13 @@ def _cmd_list(impls: list[Implementation]) -> int:
     print("Implementations:")
     if not impls:
         print("  (none)")
+    width = max((len(i.id) for i in impls), default=0)
     for impl in impls:
         state = "built" if impl.is_built else "not built"
-        version = runner.implementation_version(impl) if impl.is_built else None
-        print(f"  {impl.name:<12} {state}" + (f" ({version})" if version else ""))
+        if impl.is_built and impl.version:
+            state += f" ({impl.version})"
+        note = f"  variant: {impl.variant_description}" if impl.variant_description else ""
+        print(f"  {impl.id:<{width}}  {state}{note}")
     print("Scenarios:")
     for s in scenarios.SCENARIOS:
         print(f"  {s.id}  {s.description}")
@@ -73,10 +80,10 @@ def _cmd_list(impls: list[Implementation]) -> int:
 def _select(
     impls: list[Implementation], names: list[str] | None, role: str
 ) -> list[Implementation]:
-    built = {i.name: i for i in impls if i.is_built}
+    built = {i.id: i for i in impls if i.is_built}
     if names is None:
         return list(built.values())
-    known = {i.name for i in impls}
+    known = {i.id for i in impls}
     chosen = []
     for name in _split(names):
         if name not in known:
@@ -122,7 +129,7 @@ def _cmd_run(args: argparse.Namespace, impls: list[Implementation]) -> int:
                 failed += result.outcome in FAILING
                 reason = f"  {result.reason}" if result.reason else ""
                 print(
-                    f"{scenario.id}  {client.name}__{server.name}  {result.outcome}"
+                    f"{scenario.id}  {client.id}__{server.id}  {result.outcome}"
                     f"  {result.duration_s:.2f}s{reason}",
                     flush=True,
                 )
@@ -131,12 +138,19 @@ def _cmd_run(args: argparse.Namespace, impls: list[Implementation]) -> int:
     return EXIT_FAILED if failed else 0
 
 
+def _discover(args: argparse.Namespace) -> list[Implementation]:
+    try:
+        return implementations.discover(args.implementations_dir, args.build_dir)
+    except ValueError as e:  # malformed variants file
+        raise UsageError(str(e)) from None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    impls = implementations.discover(args.implementations_dir, args.build_dir)
-    if args.command == "list":
-        return _cmd_list(impls)
     try:
+        impls = _discover(args)
+        if args.command == "list":
+            return _cmd_list(impls)
         return _cmd_run(args, impls)
     except UsageError as e:
         print(f"dtls-interop: {e}", file=sys.stderr)

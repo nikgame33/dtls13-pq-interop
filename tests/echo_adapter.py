@@ -7,16 +7,21 @@ import shlex
 import sys
 from pathlib import Path
 
-from dtls_interop.implementations import Implementation
+from dtls_interop.implementations import VARIANTS_FILE, Implementation
 
 ECHO_ADAPTER = Path(__file__).parent / "fixtures" / "udp_echo" / "run"
 ECHO_VERSION = "udp-echo 1.0"
 
 
-def install(root: Path, name: str, *flags: str, built: bool = True) -> Implementation:
-    """Create <root>/implementations/<name>/ and, if built, <root>/build/<name>/.built."""
+def install(
+    root: Path, name: str, *flags: str, built: bool = True, variants: str | None = None
+) -> Implementation:
+    """Create <root>/implementations/<name>/ (with an optional variants file) and, if built,
+    <root>/build/<name>/.built. Returns the default-variant entry."""
     impl_dir = root / "implementations" / name
     impl_dir.mkdir(parents=True)
+    if variants is not None:
+        (impl_dir / VARIANTS_FILE).write_text(variants)
     build_script = impl_dir / "build.sh"
     build_script.write_text("#!/bin/sh\nexit 0\n")
     adapter = impl_dir / "run"

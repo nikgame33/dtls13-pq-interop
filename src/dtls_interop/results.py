@@ -22,7 +22,7 @@ from typing import Any
 SCHEMA_VERSION = 1
 RESULT_FILE = "result.json"
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 
 class Outcome(StrEnum):
@@ -40,6 +40,7 @@ class SchemaError(ValueError):
 @dataclass(frozen=True)
 class AdapterRecord:
     implementation: str
+    variant: str
     implementation_version: str | None
     command: list[str]
     started: bool
@@ -88,7 +89,7 @@ def utc_now() -> datetime.datetime:
 
 
 def check_name(name: str) -> str:
-    """Names become path components; "__" separates client and server."""
+    """Names become path components; "__" separates client and server, "+" marks a variant."""
     if not _NAME_RE.match(name) or "__" in name:
         raise ValueError(f"invalid name for a results path: {name!r}")
     return name

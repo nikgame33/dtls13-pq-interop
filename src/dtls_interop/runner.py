@@ -7,7 +7,6 @@ import dataclasses
 import json
 import os
 import signal
-import socket
 import subprocess
 import threading
 import time
@@ -46,8 +45,12 @@ _RESULT_FIELDS = {
     "version": (str, True),
     "group": (str, True),
     "hrr": (bool, True),
+    "hrr_cookie": (bool, True),
+    "hrr_group": (bool, True),
     "error": (str, True),
 }
+EXIT_UNSUPPORTED = 2
+EXIT_USAGE = 64
 
 type Address = tuple[str, int]
 
@@ -62,39 +65,26 @@ class PathHandle(Protocol):
     def address(self) -> Address: ...
 
 
-# Called with the server address and the scenario's path conditions; entered before any adapter
-# starts and exited after both are reaped. May raise to refuse unknown impairments.
+# Called with the server's bound address and the path conditions once the server is ready;
+# exited after both adapters are reaped. May raise to refuse unknown impairments.
 type PathFactory = Callable[[Address, PathConditions], AbstractContextManager[PathHandle]]
 
 
-def free_udp_port(host: str = LOOPBACK) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind((host, 0))
-        return s.getsockname()[1]
-
-
-def implementation_version(impl: Implementation) -> str | None:
-    """First line of the .built marker, if build.sh wrote one."""
-    try:
-        text = (impl.prefix / ".built").read_text().strip()
-    except OSError:
-        return None
-    return text.splitlines()[0] if text else None
-
-
-def server_command(impl: Implementation, scenario: Scenario, port: int, pki: TestPki) -> list[str]:
+def server_command(impl: Implementation, scenario: Scenario, pki: TestPki) -> list[str]:
+    """The server binds port 0 and reports the bound port in its ready line."""
     s = scenario.server
     return [
         str(impl.adapter),
         "--role=server",
+        f"--variant={impl.variant}",
         f"--host={LOOPBACK}",
-        f"--port={port}",
+        "--port=0",
         f"--groups={','.join(s.groups)}",
         f"--mtu={s.mtu}",
+        f"--ca={pki.ca_cert}",
         f"--validate={s.validate}",
         f"--cert={pki.server_cert}",
         f"--key={pki.server_key}",
-        f"--ca={pki.ca_cert}",
     ]
 
 
@@ -105,12 +95,13 @@ def client_command(
     return [
         str(impl.adapter),
         "--role=client",
+        f"--variant={impl.variant}",
         f"--host={address[0]}",
         f"--port={address[1]}",
         f"--groups={','.join(c.groups)}",
-        f"--key-share={c.key_share}",
         f"--mtu={c.mtu}",
         f"--ca={pki.ca_cert}",
+        f"--key-share={c.key_share}",
     ]
 
 
@@ -136,7 +127,18 @@ def parse_result_line(lines: list[str]) -> tuple[dict[str, Any] | None, str | No
         value = result[key]
         if not (isinstance(value, tp) or (nullable and value is None)):
             return result, f"result {key!r} has wrong type: {value!r}"
+    if result["hrr"] is False:
+        for key in ("hrr_cookie", "hrr_group"):
+            if result[key] is not False:
+                return result, f"result {key!r} must be false when 'hrr' is false"
     return result, None
+
+
+def ready_port(event: dict[str, Any]) -> int | None:
+    port = event.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536:
+        return port
+    return None
 
 
 class _Adapter:
@@ -151,6 +153,7 @@ class _Adapter:
         self.case_dir = case_dir
         self.proc: subprocess.Popen[bytes] | None = None
         self.lines: list[str] = []
+        self.ready_event: dict[str, Any] | None = None
         self.eof = False
         self.killed = False
         self.exit_code: int | None = None
@@ -186,24 +189,25 @@ class _Adapter:
                 log.write(raw)
                 log.flush()
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                event = _ready_event(line) if self.ready_event is None else None
                 with self._cond:
                     self.lines.append(line)
+                    if event is not None:
+                        self.ready_event = event
                     self._cond.notify_all()
         with self._cond:
             self.eof = True
             self._cond.notify_all()
 
-    def wait_ready(self, deadline: float) -> bool:
-        def seen() -> bool:
-            return any(_is_ready(line) for line in self.lines)
-
+    def wait_ready(self, deadline: float) -> dict[str, Any] | None:
+        """The first {"event": "ready"} object, or None at EOF or the deadline."""
         with self._cond:
-            while not seen() and not self.eof:
+            while self.ready_event is None and not self.eof:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._cond.wait(remaining)
-            return seen()
+            return self.ready_event
 
     def wait_exit(self, deadline: float) -> bool:
         assert self.proc is not None
@@ -244,7 +248,8 @@ class _Adapter:
     def record(self) -> AdapterRecord:
         return AdapterRecord(
             implementation=self.impl.name,
-            implementation_version=implementation_version(self.impl),
+            variant=self.impl.variant,
+            implementation_version=self.impl.version,
             command=self.command,
             started=self.started,
             exit_code=self.exit_code,
@@ -259,13 +264,20 @@ class _Adapter:
         err = (self.result or {}).get("error")
         return f"{self.role}: {err}" if err else f"{self.role}: exit {self.exit_code}"
 
+    def stderr_tail(self) -> str:
+        try:
+            lines = (self.case_dir / self.stderr_name).read_text(errors="replace").splitlines()
+        except OSError:
+            return ""
+        return next((line.strip() for line in reversed(lines) if line.strip()), "")
 
-def _is_ready(line: str) -> bool:
+
+def _ready_event(line: str) -> dict[str, Any] | None:
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
-        return False
-    return isinstance(obj, dict) and obj.get("event") == "ready"
+        return None
+    return obj if isinstance(obj, dict) and obj.get("event") == "ready" else None
 
 
 def _signal_name(code: int) -> str:
@@ -290,8 +302,8 @@ def _expectation_mismatches(scenario: Scenario, sides: list[_Adapter]) -> list[s
     out = []
     for side in sides:
         result = side.result or {}
-        for key, want in (("version", exp.version), ("group", exp.group), ("hrr", exp.hrr)):
-            got = result.get(key)
+        for key in ("version", "group", "hrr", "hrr_cookie", "hrr_group"):
+            want, got = getattr(exp, key), result.get(key)
             if want is not None and got is not None and got != want:
                 out.append(f"{side.role} reported {key}={got!r}, expected {want!r}")
     return out
@@ -329,7 +341,11 @@ def _classify(
 ) -> tuple[Outcome, str | None]:
     sides = [a for a in (server, client) if a.started]
     for a in sides:
-        if a.exit_code == 2:
+        if a.exit_code == EXIT_USAGE:
+            err = (a.result or {}).get("error") or a.stderr_tail()
+            return Outcome.ERROR, f"usage error ({a.role}): {err}"
+    for a in sides:
+        if a.exit_code == EXIT_UNSUPPORTED:
             return Outcome.UNSUPPORTED, a.error_text()
     for a in sides:
         if a.exit_code is not None and a.exit_code < 0:
@@ -364,38 +380,49 @@ def _classify(
     return Outcome.PASS, None
 
 
+class _Abort(Exception):
+    """Stop the case early with outcome error and this reason."""
+
+
 def _execute(
     scenario: Scenario,
     server: _Adapter,
     client: _Adapter,
-    server_addr: Address,
     pki: TestPki,
     path_factory: PathFactory | None,
     limits: _Limits,
 ) -> tuple[Outcome, str | None, object | None]:
     """Returns (outcome, reason, active path or None)."""
     deadline = time.monotonic() + limits.case_timeout
+    path = None
+    ready = None
     with contextlib.ExitStack() as stack:
-        path = None
-        if path_factory is not None:
-            try:
-                path = stack.enter_context(path_factory(server_addr, scenario.path))
-            except Exception as e:  # plugin boundary: a refused or broken path is a recorded error
-                return Outcome.ERROR, f"path setup failed: {e}", None
-            client.command = client_command(client.impl, scenario, path.address, pki)
         try:
             server.start()
             ready = server.wait_ready(min(deadline, time.monotonic() + limits.ready_timeout))
-            if ready:
+            if ready is not None:
+                port = ready_port(ready)
+                if port is None:
+                    raise _Abort(f"server: ready line without a valid port: {ready!r}")
+                address: Address = (LOOPBACK, port)
+                if path_factory is not None:
+                    try:
+                        path = stack.enter_context(path_factory(address, scenario.path))
+                    except Exception as e:  # plugin boundary: a refusal is a recorded error
+                        raise _Abort(f"path setup failed: {e}") from e
+                    address = path.address
+                client.command = client_command(client.impl, scenario, address, pki)
                 client.start()
                 if client.wait_exit(deadline):
                     server.wait_exit(min(deadline, time.monotonic() + limits.server_grace))
+        except _Abort as e:
+            return Outcome.ERROR, str(e), path
         except OSError as e:
             return Outcome.ERROR, f"cannot start adapter: {e}", path
         finally:
             client.stop()
             server.stop()
-    return *_classify(scenario, server, client, ready, limits), path
+    return *_classify(scenario, server, client, ready is not None, limits), path
 
 
 def run_case(
@@ -414,15 +441,13 @@ def run_case(
 
     Both adapter process groups are killed and reaped on every exit path.
     """
-    case_dir = layout.case_dir(scenario.id, client_impl.name, server_impl.name)
+    case_dir = layout.case_dir(scenario.id, client_impl.id, server_impl.id)
     case_dir.mkdir(parents=True, exist_ok=True)
     timestamp = utc_now()
     t0 = time.monotonic()
-    server_addr = (LOOPBACK, free_udp_port())
-    server_cmd = server_command(server_impl, scenario, server_addr[1], pki)
-    server = _Adapter("server", server_impl, server_cmd, case_dir)
-    client_cmd = client_command(client_impl, scenario, server_addr, pki)
-    client = _Adapter("client", client_impl, client_cmd, case_dir)
+    server = _Adapter("server", server_impl, server_command(server_impl, scenario, pki), case_dir)
+    # The client's command is known once the server has reported its port.
+    client = _Adapter("client", client_impl, [], case_dir)
     limits = _Limits(ready_timeout, case_timeout, server_grace)
 
     path = None
@@ -430,9 +455,7 @@ def run_case(
     if precheck is not None:
         outcome, reason = Outcome.ERROR, precheck
     else:
-        outcome, reason, path = _execute(
-            scenario, server, client, server_addr, pki, path_factory, limits
-        )
+        outcome, reason, path = _execute(scenario, server, client, pki, path_factory, limits)
 
     result = CaseResult(
         schema_version=SCHEMA_VERSION,

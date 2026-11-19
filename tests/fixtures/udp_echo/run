@@ -4,22 +4,96 @@
 import argparse
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
 import sys
 import threading
 
-BEHAVIOURS = ("normal", "never-ready", "hang", "exit2", "garbage", "bad-result", "crash", "fail")
+EXIT_USAGE = 64
+BEHAVIOURS = (
+    "normal",
+    "never-ready",
+    "ready-no-port",
+    "hang",
+    "exit2",
+    "garbage",
+    "bad-result",
+    "crash",
+    "fail",
+)
+ROLE_OPTIONS = {
+    "client": {"key_share"},
+    "server": {"validate", "cert", "key"},
+}
+COMMON_OPTIONS = {"variant", "host", "port", "groups", "mtu", "ca"}
 RECV_TIMEOUT = 30.0
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(EXIT_USAGE, f"{self.prog}: usage error: {message}\n")
+
+
+def name(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
+        raise argparse.ArgumentTypeError(f"invalid name {value!r}")
+    return value
+
+
+def mtu(value):
+    if value == "default":
+        return value
+    if not value.isdigit() or int(value) < 576:
+        raise argparse.ArgumentTypeError(f"invalid mtu {value!r}")
+    return int(value)
+
+
+def report(value):
+    key, sep, raw = value.partition("=")
+    if not sep:
+        raise argparse.ArgumentTypeError(f"expected KEY=JSON, got {value!r}")
+    return key, json.loads(raw)
+
+
+def parse_args(parser):
+    parser.add_argument("--role", choices=("client", "server"))
+    parser.add_argument("--variant", type=name)
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--groups")
+    parser.add_argument("--mtu", type=mtu)
+    parser.add_argument("--ca")
+    parser.add_argument("--key-share")
+    parser.add_argument("--validate", choices=("off", "cookie"))
+    parser.add_argument("--cert")
+    parser.add_argument("--key")
+    # Test-only switches, appended by the wrappers the tests install.
+    parser.add_argument("--behave", choices=BEHAVIOURS, default="normal")
+    parser.add_argument("--spawn-child", action="store_true", help="leave a long-lived grandchild")
+    parser.add_argument("--report", type=report, action="append", default=[], help="KEY=JSON")
+    args = parser.parse_args()
+    if args.role is None:
+        parser.error("--role is required")
+    other = "server" if args.role == "client" else "client"
+    for opt in sorted(COMMON_OPTIONS | ROLE_OPTIONS[args.role]):
+        if getattr(args, opt) is None:
+            parser.error(f"--{opt.replace('_', '-')} is required for {args.role}")
+    for opt in sorted(ROLE_OPTIONS[other]):
+        if getattr(args, opt) is not None:
+            parser.error(f"--{opt.replace('_', '-')} is a {other} option")
+    return args
 
 
 def emit(obj):
     print(json.dumps(obj), flush=True)
 
 
-def result(ok, error=None, group=None):
-    emit({"event": "result", "ok": ok, "version": None, "group": group, "hrr": None, "error": error})
+def result(args, ok, error=None):
+    fields = {"version": None, "group": None, "hrr": None, "hrr_cookie": None, "hrr_group": None}
+    fields.update(args.report)
+    emit({"event": "result", "ok": ok, **fields, "error": error})
 
 
 def hang():
@@ -27,24 +101,14 @@ def hang():
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--role", choices=("client", "server"), required=True)
-    p.add_argument("--host", required=True)
-    p.add_argument("--port", type=int, required=True)
-    for opt in ("--groups", "--key-share", "--mtu", "--validate", "--cert", "--key", "--ca"):
-        p.add_argument(opt)
-    p.add_argument("--behave", choices=BEHAVIOURS, default="normal")
-    p.add_argument("--spawn-child", action="store_true", help="leave a long-lived grandchild")
-    p.add_argument("--report-group", help="group to claim in the result line")
-    args = p.parse_args()
-
-    print(f"pid={os.getpid()}", file=sys.stderr, flush=True)
+    args = parse_args(Parser())
+    print(f"pid={os.getpid()} variant={args.variant}", file=sys.stderr, flush=True)
     if args.spawn_child:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"])
         print(f"child-pid={child.pid}", file=sys.stderr, flush=True)
 
     if args.behave == "exit2":
-        result(False, f"{args.role}: configuration not supported")
+        result(args, False, f"{args.role}: configuration not supported")
         return 2
     if args.behave == "garbage":
         print("this is not JSON", flush=True)
@@ -55,14 +119,17 @@ def main():
         sock.bind((args.host, args.port))
         if args.behave == "never-ready":
             hang()
-        emit({"event": "ready"})
+        if args.behave == "ready-no-port":
+            emit({"event": "ready"})
+            hang()
+        emit({"event": "ready", "port": sock.getsockname()[1]})
         if args.behave == "hang":
             hang()
         data, peer = sock.recvfrom(2048)
         if args.behave == "crash":
             os.kill(os.getpid(), signal.SIGKILL)
         if data != b"ping":
-            result(False, f"unexpected payload {data!r}")
+            result(args, False, f"unexpected payload {data!r}")
             return 1
         sock.sendto(b"pong", peer)
     else:
@@ -74,16 +141,16 @@ def main():
         if args.behave == "crash":
             os.kill(os.getpid(), signal.SIGKILL)
         if data != b"pong":
-            result(False, f"unexpected payload {data!r}")
+            result(args, False, f"unexpected payload {data!r}")
             return 1
 
     if args.behave == "fail":
-        result(False, "simulated handshake failure")
+        result(args, False, "simulated handshake failure")
         return 1
     if args.behave == "bad-result":
         emit({"event": "result", "ok": True})
         return 0
-    result(True, group=args.report_group)
+    result(args, True)
     return 0
 
 

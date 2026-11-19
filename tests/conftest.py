@@ -14,11 +14,13 @@ def test_pki(tmp_path_factory: pytest.TempPathFactory) -> pki.TestPki:
 
 
 def _require_built(name: str) -> implementations.Implementation:
-    by_name = {i.name: i for i in implementations.discover()}
+    by_name = {i.id: i for i in implementations.discover()}
     impl = by_name.get(name)
-    required = name in implementations.required_names()
+    # Requiring an implementation also requires all its variants.
+    base = name.partition(implementations.VARIANT_SEPARATOR)[0]
+    required = bool({name, base} & implementations.required_names())
     if impl is None or not impl.is_built:
-        reason = f"{name} not built (run implementations/{name}/build.sh)"
+        reason = f"{name} not built (run implementations/{base}/build.sh)"
         if required:
             pytest.fail(f"{reason}, but {implementations.REQUIRED_ENV} requires it")
         pytest.skip(reason)

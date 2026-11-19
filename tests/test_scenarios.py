@@ -7,7 +7,7 @@ import pytest
 
 from dtls_interop import scenarios
 from dtls_interop.implementations import REPO_ROOT
-from dtls_interop.scenarios import EMPTY_KEY_SHARE, SCENARIOS, Impairment, Transport
+from dtls_interop.scenarios import EMPTY_KEY_SHARE, SCENARIOS, Impairment, Transport, Validate
 
 KNOWN_GROUPS = {
     scenarios.X25519,
@@ -41,6 +41,11 @@ def test_scenario_is_consistent(scenario):
     assert client.mtu == server.mtu == scenario.path.pmtu
     if scenario.expected.group is not None:
         assert scenario.expected.group in set(client.groups) & set(server.groups)
+    exp = scenario.expected
+    if exp.hrr is False:
+        assert exp.hrr_cookie is False and exp.hrr_group is False
+    if scenario.server.validate is Validate.COOKIE:
+        assert exp.hrr is True and exp.hrr_cookie is True
     assert scenario.expected.version == (
         "DTLSv1.3" if scenario.transport is Transport.DTLS else "TLSv1.3"
     )
