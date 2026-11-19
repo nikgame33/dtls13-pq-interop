@@ -32,6 +32,21 @@ run --role client|server
 Client behaviour: complete the handshake, send `ping`, expect `pong`, exit.
 Server behaviour: accept one connection, answer `ping` with `pong`, exit.
 
+## Output protocol
+
+stdout carries only JSON lines; everything else goes to stderr and is kept in the run log.
+
+- Server, once its socket is bound and it accepts datagrams: `{"event": "ready"}`.
+The runner starts the client only after this line.
+- Both roles, last line before exit:
+
+```json
+{"event": "result", "ok": true, "version": "DTLSv1.3", "group": "X25519MLKEM768", "hrr": false, "error": null}
+```
+
+`version` and `group` use IANA names; `hrr` says whether a HelloRetryRequest happened; `error` is a short string from the library on failure.
+Fields the library cannot report are `null`, never guessed.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -40,7 +55,6 @@ Server behaviour: accept one connection, answer `ping` with `pong`, exit.
 | 1 | Failure (handshake error, alert, wrong echo) |
 | 2 | Configuration not supported by this implementation (reported as "unsupported", not "fail") |
 
-The adapter prints one JSON line on stdout at exit with the negotiated version, group, whether HRR occurred, and any error string.
-Everything else goes to stderr and is kept in the run log.
+## System packages
 
-Open points are tracked in TODO.md.
+If the build needs Debian/Ubuntu packages beyond a stock GitHub `ubuntu-24.04` runner, list them one per line in `implementations/<name>/apt-packages.txt`; CI installs them before `build.sh`.

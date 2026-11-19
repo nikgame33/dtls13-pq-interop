@@ -56,6 +56,10 @@ jobs:
         with:
           path: .build/${{ matrix.name }}
           key: build-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles(format('implementations/{0}/build.sh', matrix.name), format('implementations/{0}/*.patch', matrix.name)) }}
+      - name: Install system packages
+        run: |
+          f=implementations/${{ matrix.name }}/apt-packages.txt
+          if [ -f "$f" ]; then sudo apt-get update -q && xargs -a "$f" sudo apt-get install -y -q --no-install-recommends; fi
       - name: Build
         run: implementations/${{ matrix.name }}/build.sh
       - name: Adapter tests
