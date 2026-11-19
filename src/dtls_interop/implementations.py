@@ -26,17 +26,19 @@ class Implementation:
         return (self.prefix / ".built").is_file()
 
 
-def discover() -> list[Implementation]:
+def discover(
+    implementations_dir: Path = IMPLEMENTATIONS_DIR, build_dir: Path = BUILD_DIR
+) -> list[Implementation]:
     """All implementations that ship a build.sh."""
     found = []
-    for build_script in sorted(IMPLEMENTATIONS_DIR.glob("*/build.sh")):
+    for build_script in sorted(implementations_dir.glob("*/build.sh")):
         name = build_script.parent.name
         found.append(
             Implementation(
                 name=name,
                 adapter=build_script.parent / "run",
                 build_script=build_script,
-                prefix=BUILD_DIR / name,
+                prefix=build_dir / name,
             )
         )
     return found

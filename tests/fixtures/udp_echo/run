@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Test-only adapter: the shim contract over plain UDP (no DTLS), with injectable misbehaviour."""
+
+import argparse
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+
+BEHAVIOURS = ("normal", "never-ready", "hang", "exit2", "garbage", "bad-result", "crash", "fail")
+RECV_TIMEOUT = 30.0
+
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def result(ok, error=None, group=None):
+    emit({"event": "result", "ok": ok, "version": None, "group": group, "hrr": None, "error": error})
+
+
+def hang():
+    threading.Event().wait()
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--role", choices=("client", "server"), required=True)
+    p.add_argument("--host", required=True)
+    p.add_argument("--port", type=int, required=True)
+    for opt in ("--groups", "--key-share", "--mtu", "--validate", "--cert", "--key", "--ca"):
+        p.add_argument(opt)
+    p.add_argument("--behave", choices=BEHAVIOURS, default="normal")
+    p.add_argument("--spawn-child", action="store_true", help="leave a long-lived grandchild")
+    p.add_argument("--report-group", help="group to claim in the result line")
+    args = p.parse_args()
+
+    print(f"pid={os.getpid()}", file=sys.stderr, flush=True)
+    if args.spawn_child:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3600)"])
+        print(f"child-pid={child.pid}", file=sys.stderr, flush=True)
+
+    if args.behave == "exit2":
+        result(False, f"{args.role}: configuration not supported")
+        return 2
+    if args.behave == "garbage":
+        print("this is not JSON", flush=True)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(RECV_TIMEOUT)
+    if args.role == "server":
+        sock.bind((args.host, args.port))
+        if args.behave == "never-ready":
+            hang()
+        emit({"event": "ready"})
+        if args.behave == "hang":
+            hang()
+        data, peer = sock.recvfrom(2048)
+        if args.behave == "crash":
+            os.kill(os.getpid(), signal.SIGKILL)
+        if data != b"ping":
+            result(False, f"unexpected payload {data!r}")
+            return 1
+        sock.sendto(b"pong", peer)
+    else:
+        if args.behave == "hang":
+            hang()
+        sock.connect((args.host, args.port))
+        sock.send(b"ping")
+        data = sock.recv(2048)
+        if args.behave == "crash":
+            os.kill(os.getpid(), signal.SIGKILL)
+        if data != b"pong":
+            result(False, f"unexpected payload {data!r}")
+            return 1
+
+    if args.behave == "fail":
+        result(False, "simulated handshake failure")
+        return 1
+    if args.behave == "bad-result":
+        emit({"event": "result", "ok": True})
+        return 0
+    result(True, group=args.report_group)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
