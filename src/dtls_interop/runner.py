@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
-from dtls_interop.implementations import Implementation
+from dtls_interop.implementations import CLIENT, SERVER, Implementation
 from dtls_interop.pki import TestPki
 from dtls_interop.results import (
     SCHEMA_VERSION,
@@ -399,8 +399,12 @@ def _execute(
     with contextlib.ExitStack() as stack:
         try:
             server.start()
-            ready = server.wait_ready(min(deadline, time.monotonic() + limits.ready_timeout))
-            if ready is not None:
+            ready_deadline = min(deadline, time.monotonic() + limits.ready_timeout)
+            ready = server.wait_ready(ready_deadline)
+            if ready is None:
+                # stdout closes just before the process exits; collect the exit code, don't kill.
+                server.wait_exit(ready_deadline)
+            else:
                 port = ready_port(ready)
                 if port is None:
                     raise _Abort(f"server: ready line without a valid port: {ready!r}")
@@ -441,6 +445,9 @@ def run_case(
 
     Both adapter process groups are killed and reaped on every exit path.
     """
+    for impl, role in ((client_impl, CLIENT), (server_impl, SERVER)):
+        if role not in impl.roles:
+            raise ValueError(f"{impl.id} is not a {role} entry")
     case_dir = layout.case_dir(scenario.id, client_impl.id, server_impl.id)
     case_dir.mkdir(parents=True, exist_ok=True)
     timestamp = utc_now()

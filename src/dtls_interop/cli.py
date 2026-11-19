@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from dtls_interop import implementations, pki, runner, scenarios
-from dtls_interop.implementations import Implementation
+from dtls_interop.implementations import BOTH_ROLES, CLIENT, SERVER, Implementation
 from dtls_interop.results import Outcome, RunLayout
 
 DEFAULT_RESULTS_DIR = implementations.REPO_ROOT / "results"
@@ -69,7 +69,10 @@ def _cmd_list(impls: list[Implementation]) -> int:
         state = "built" if impl.is_built else "not built"
         if impl.is_built and impl.version:
             state += f" ({impl.version})"
-        note = f"  variant: {impl.variant_description}" if impl.variant_description else ""
+        note = ""
+        if impl.variant_description:
+            roles = "both" if impl.roles == BOTH_ROLES else "/".join(sorted(impl.roles))
+            note = f"  {roles} variant: {impl.variant_description}"
         print(f"  {impl.id:<{width}}  {state}{note}")
     print("Scenarios:")
     for s in scenarios.SCENARIOS:
@@ -80,17 +83,19 @@ def _cmd_list(impls: list[Implementation]) -> int:
 def _select(
     impls: list[Implementation], names: list[str] | None, role: str
 ) -> list[Implementation]:
-    built = {i.id: i for i in impls if i.is_built}
     if names is None:
-        return list(built.values())
-    known = {i.id for i in impls}
+        return [i for i in impls if i.is_built and role in i.roles]
+    by_id = {i.id: i for i in impls}
     chosen = []
     for name in _split(names):
-        if name not in known:
+        impl = by_id.get(name)
+        if impl is None:
             raise UsageError(f"unknown {role} implementation {name!r}")
-        if name not in built:
+        if role not in impl.roles:
+            raise UsageError(f"variant {name!r} does not apply to the {role} role")
+        if not impl.is_built:
             raise UsageError(f"{role} implementation {name!r} is not built")
-        chosen.append(built[name])
+        chosen.append(impl)
     return chosen
 
 
@@ -103,8 +108,8 @@ def _cmd_run(args: argparse.Namespace, impls: list[Implementation]) -> int:
             selected = [scenarios.get(i) for i in ids]
         except KeyError as e:
             raise UsageError(e.args[0]) from None
-    clients = _select(impls, args.client, "client")
-    servers = _select(impls, args.server, "server")
+    clients = _select(impls, args.client, CLIENT)
+    servers = _select(impls, args.server, SERVER)
     if not clients or not servers:
         raise UsageError("no built implementations to run")
 

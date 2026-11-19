@@ -4,7 +4,7 @@ import pytest
 from echo_adapter import install
 
 from dtls_interop import implementations
-from dtls_interop.implementations import read_variants
+from dtls_interop.implementations import BOTH_ROLES, read_variants
 
 
 def discover(root):
@@ -12,7 +12,7 @@ def discover(root):
 
 
 def test_one_entry_per_variant_default_first(tmp_path):
-    install(tmp_path, "lib", variants="b-path: Second\n\na.path: First\n")
+    install(tmp_path, "lib", variants="server b-path: Second\n\nboth a.path: First\n")
     install(tmp_path, "other", built=False)
 
     entries = discover(tmp_path)
@@ -25,6 +25,7 @@ def test_one_entry_per_variant_default_first(tmp_path):
     ]
     assert entries[1].variant_description == "Second"
     assert entries[0].variant_description is None
+    assert [e.roles for e in entries[:3]] == [BOTH_ROLES, {"server"}, BOTH_ROLES]
     # Variants share the adapter and the build.
     assert {e.adapter for e in entries[:3]} == {entries[0].adapter}
     assert all(e.is_built for e in entries[:3])
@@ -35,12 +36,14 @@ def test_one_entry_per_variant_default_first(tmp_path):
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ("nocolon\n", "expected 'NAME: description'"),
-        ("x:\n", "expected 'NAME: description'"),
-        ("bad name: d\n", "expected 'NAME: description'"),
-        ("a+b: d\n", "expected 'NAME: description'"),
-        ("default: d\n", "duplicate or reserved variant 'default'"),
-        ("a: one\na: two\n", "duplicate or reserved variant 'a'"),
+        ("client nocolon\n", "expected 'ROLE NAME: description'"),
+        ("client x:\n", "expected 'ROLE NAME: description'"),
+        ("x: no role\n", "expected 'ROLE NAME: description'"),
+        ("peer x: unknown role\n", "expected 'ROLE NAME: description'"),
+        ("client bad name: d\n", "expected 'ROLE NAME: description'"),
+        ("both a+b: d\n", "expected 'ROLE NAME: description'"),
+        ("both default: d\n", "duplicate or reserved variant 'default'"),
+        ("client a: one\nserver a: two\n", "duplicate or reserved variant 'a'"),
     ],
 )
 def test_malformed_variants_file(tmp_path, text, message):

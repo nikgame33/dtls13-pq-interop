@@ -17,6 +17,10 @@ REQUIRED_ENV = "DTLS_INTEROP_REQUIRE"
 DEFAULT_VARIANT = "default"
 VARIANTS_FILE = "variants"
 VARIANT_SEPARATOR = "+"
+CLIENT = "client"
+SERVER = "server"
+BOTH_ROLES = frozenset({CLIENT, SERVER})
+_ROLE_WORDS = {CLIENT: frozenset({CLIENT}), SERVER: frozenset({SERVER}), "both": BOTH_ROLES}
 _VARIANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -28,6 +32,8 @@ class Implementation:
     prefix: Path
     variant: str = DEFAULT_VARIANT
     variant_description: str | None = None
+    # Roles this entry runs in; default entries run in both.
+    roles: frozenset[str] = BOTH_ROLES
 
     @property
     def id(self) -> str:
@@ -50,21 +56,35 @@ class Implementation:
         return text.splitlines()[0] if text else None
 
 
-def read_variants(path: Path) -> list[tuple[str, str]]:
-    """Parse a variants file (`NAME: description` per line); a missing file means none."""
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    roles: frozenset[str]
+    description: str
+
+
+def read_variants(path: Path) -> list[Variant]:
+    """Parse a variants file (`ROLE NAME: description` per line); a missing file means none."""
     if not path.is_file():
         return []
-    variants: list[tuple[str, str]] = []
+    variants: list[Variant] = []
     for number, line in enumerate(path.read_text().splitlines(), start=1):
         if not line.strip():
             continue
-        name, sep, description = line.partition(":")
-        name, description = name.strip(), description.strip()
-        if not sep or not _VARIANT_RE.match(name) or not description:
-            raise ValueError(f"{path}:{number}: expected 'NAME: description', got {line!r}")
-        if name == DEFAULT_VARIANT or name in dict(variants):
+        head, sep, description = line.partition(":")
+        words, description = head.split(), description.strip()
+        if (
+            not sep
+            or len(words) != 2
+            or words[0] not in _ROLE_WORDS
+            or not _VARIANT_RE.match(words[1])
+            or not description
+        ):
+            raise ValueError(f"{path}:{number}: expected 'ROLE NAME: description', got {line!r}")
+        name = words[1]
+        if name == DEFAULT_VARIANT or any(v.name == name for v in variants):
             raise ValueError(f"{path}:{number}: duplicate or reserved variant {name!r}")
-        variants.append((name, description))
+        variants.append(Variant(name, _ROLE_WORDS[words[0]], description))
     return variants
 
 
@@ -82,15 +102,16 @@ def discover(
             prefix=build_dir / name,
         )
         found.append(base)
-        for variant, description in read_variants(build_script.parent / VARIANTS_FILE):
+        for variant in read_variants(build_script.parent / VARIANTS_FILE):
             found.append(
                 Implementation(
                     name=name,
                     adapter=base.adapter,
                     build_script=build_script,
                     prefix=base.prefix,
-                    variant=variant,
-                    variant_description=description,
+                    variant=variant.name,
+                    variant_description=variant.description,
+                    roles=variant.roles,
                 )
             )
     return found

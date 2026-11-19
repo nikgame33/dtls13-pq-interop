@@ -136,21 +136,22 @@ def test_run_requires_scenario(impl_root):
 
 
 def test_variants_are_listed_and_selectable(impl_root, tmp_path):
-    install(impl_root, "echo-v", variants="alt: Alternative code path\n\nslow: Slow path\n")
+    variants = "client alt: Alternative code path\n\nserver slow: Slow path\nboth x: Both\n"
+    install(impl_root, "echo-v", variants=variants)
     listing = cli(impl_root, "list")
 
     assert listing.returncode == 0, listing.stderr
-    assert f"  echo-v+alt    built ({ECHO_VERSION})  variant: Alternative code path" in (
-        listing.stdout.splitlines()
-    )
-    assert "  echo-v+slow   built" in listing.stdout
+    lines = listing.stdout.splitlines()
+    assert f"  echo-v+alt    built ({ECHO_VERSION})  client variant: Alternative code path" in lines
+    assert f"  echo-v+slow   built ({ECHO_VERSION})  server variant: Slow path" in lines
+    assert f"  echo-v+x      built ({ECHO_VERSION})  both variant: Both" in lines
 
     results = tmp_path / "results"
     proc = cli(
         impl_root,
         "run",
         "--scenario=S01",
-        "--client=echo-v+alt",
+        "--client=echo-v+alt,echo-v+x",
         "--server=echo-v,echo-v+slow",
         f"--results-dir={results}",
     )
@@ -159,10 +160,38 @@ def test_variants_are_listed_and_selectable(impl_root, tmp_path):
     assert "S01  echo-v+alt__echo-v+slow  pass" in proc.stdout
     [run_dir] = run_dirs(results)
     cases = read_run(run_dir)
-    assert [(c.client.variant, c.server.variant) for c in cases] == [
+    assert sorted((c.client.variant, c.server.variant) for c in cases) == [
         ("alt", "default"),
         ("alt", "slow"),
+        ("x", "default"),
+        ("x", "slow"),
     ]
+
+
+def test_default_selection_respects_variant_roles(tmp_path):
+    install(tmp_path, "echo", variants="client alt: Client only\nserver slow: Server only\n")
+    results = tmp_path / "results"
+    proc = cli(tmp_path, "run", "--scenario=S01", f"--results-dir={results}")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    [run_dir] = run_dirs(results)
+    pairs = sorted(p.name for p in (run_dir / "S01").iterdir())
+    assert pairs == ["echo+alt__echo", "echo+alt__echo+slow", "echo__echo", "echo__echo+slow"]
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--client=echo+slow"], "variant 'echo+slow' does not apply to the client role"),
+        (["--server=echo+alt"], "variant 'echo+alt' does not apply to the server role"),
+    ],
+)
+def test_variant_in_wrong_role_is_usage_error(tmp_path, args, message):
+    install(tmp_path, "echo", variants="client alt: Client only\nserver slow: Server only\n")
+    proc = cli(tmp_path, "run", "--scenario=S01", *args, f"--results-dir={tmp_path / 'r'}")
+
+    assert proc.returncode == 2
+    assert message in proc.stderr
 
 
 def test_malformed_variants_file_is_usage_error(impl_root):
@@ -170,4 +199,4 @@ def test_malformed_variants_file_is_usage_error(impl_root):
     proc = cli(impl_root, "list")
 
     assert proc.returncode == 2
-    assert "expected 'NAME: description'" in proc.stderr
+    assert "expected 'ROLE NAME: description'" in proc.stderr

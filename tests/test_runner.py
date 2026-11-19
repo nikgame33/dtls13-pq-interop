@@ -15,6 +15,7 @@ import pytest
 from echo_adapter import ECHO_VERSION, child_pids, install, pid_alive
 
 from dtls_interop import implementations, runner, scenarios
+from dtls_interop.implementations import BOTH_ROLES
 from dtls_interop.results import (
     RESULT_FILE,
     SCHEMA_VERSION,
@@ -24,7 +25,7 @@ from dtls_interop.results import (
     read_result,
     read_run,
 )
-from dtls_interop.scenarios import Impairment, PathConditions
+from dtls_interop.scenarios import ClientOptions, Impairment, PathConditions
 
 S01 = scenarios.get("S01")
 # Generous deadlines for cases that should finish; they bound a failure, they are not sleeps.
@@ -427,7 +428,7 @@ def test_hrr_reason_expectations(tmp_path, layout, test_pki):
 
 
 def test_variant_is_passed_and_recorded(tmp_path, layout, test_pki):
-    install(tmp_path, "echo", variants="fast: skips nothing\n")
+    install(tmp_path, "echo", variants="client fast: Client-only path\n")
     found = implementations.discover(tmp_path / "implementations", tmp_path / "build")
     entries = {i.id: i for i in found}
     client, server = entries["echo+fast"], entries["echo"]
@@ -443,3 +444,38 @@ def test_variant_is_passed_and_recorded(tmp_path, layout, test_pki):
     assert d.name == "echo+fast__echo"
     assert "variant=fast" in (d / "client.stderr").read_text()
     assert read_result(d / RESULT_FILE) == result
+
+
+def test_variant_role_is_enforced(tmp_path, layout, test_pki):
+    install(tmp_path, "echo", variants="client fast: Client-only path\n")
+    found = implementations.discover(tmp_path / "implementations", tmp_path / "build")
+    entries = {i.id: i for i in found}
+
+    with pytest.raises(ValueError, match="echo\\+fast is not a server entry"):
+        runner.run_case(S01, entries["echo"], entries["echo+fast"], layout=layout, pki=test_pki)
+
+    # Bypassing the runner's guard, the adapter itself rejects the variant in the wrong role.
+    server = dataclasses.replace(entries["echo+fast"], roles=BOTH_ROLES)
+    result = runner.run_case(S01, entries["echo"], server, layout=layout, pki=test_pki, **OK_LIMITS)
+
+    assert result.outcome is Outcome.ERROR
+    assert "--variant=fast is not a server variant" in result.reason
+    assert result.reason.startswith("usage error (server): ")
+
+
+def test_repeated_option_is_usage_error(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, server_flags=["--groups=X25519"])
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason.endswith("usage error: --groups given more than once")
+    assert result.server.exit_code == 64
+
+
+def test_key_share_outside_groups_is_usage_error(tmp_path, layout, test_pki):
+    client_options = ClientOptions(groups=("X25519MLKEM768",), key_share="X25519", mtu=1500)
+    scenario = dataclasses.replace(S01, client=client_options)
+    result = run(tmp_path, layout, test_pki, scenario=scenario, server_grace=0.5)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason.endswith("usage error: --key-share=X25519 is not in --groups")
+    assert result.client.exit_code == 64

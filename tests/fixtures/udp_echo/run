@@ -36,6 +36,28 @@ class Parser(argparse.ArgumentParser):
         self.exit(EXIT_USAGE, f"{self.prog}: usage error: {message}\n")
 
 
+class Once(argparse.Action):
+    """Store an option that may appear only once."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest) is not None:
+            parser.error(f"{option_string} given more than once")
+        setattr(namespace, self.dest, values)
+
+
+def role_variants(path, role):
+    """Variant names usable in `role` according to a `ROLE NAME: description` file."""
+    if path is None or not os.path.isfile(path):
+        return set()
+    names = set()
+    with open(path) as f:
+        for line in f:
+            words = line.partition(":")[0].split()
+            if len(words) == 2 and words[0] in (role, "both"):
+                names.add(words[1])
+    return names
+
+
 def name(value):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value):
         raise argparse.ArgumentTypeError(f"invalid name {value!r}")
@@ -58,18 +80,19 @@ def report(value):
 
 
 def parse_args(parser):
-    parser.add_argument("--role", choices=("client", "server"))
-    parser.add_argument("--variant", type=name)
-    parser.add_argument("--host")
-    parser.add_argument("--port", type=int)
-    parser.add_argument("--groups")
-    parser.add_argument("--mtu", type=mtu)
-    parser.add_argument("--ca")
-    parser.add_argument("--key-share")
-    parser.add_argument("--validate", choices=("off", "cookie"))
-    parser.add_argument("--cert")
-    parser.add_argument("--key")
+    parser.add_argument("--role", action=Once, choices=("client", "server"))
+    parser.add_argument("--variant", action=Once, type=name)
+    parser.add_argument("--host", action=Once)
+    parser.add_argument("--port", action=Once, type=int)
+    parser.add_argument("--groups", action=Once)
+    parser.add_argument("--mtu", action=Once, type=mtu)
+    parser.add_argument("--ca", action=Once)
+    parser.add_argument("--key-share", action=Once)
+    parser.add_argument("--validate", action=Once, choices=("off", "cookie"))
+    parser.add_argument("--cert", action=Once)
+    parser.add_argument("--key", action=Once)
     # Test-only switches, appended by the wrappers the tests install.
+    parser.add_argument("--variants-file", action=Once)
     parser.add_argument("--behave", choices=BEHAVIOURS, default="normal")
     parser.add_argument("--spawn-child", action="store_true", help="leave a long-lived grandchild")
     parser.add_argument("--report", type=report, action="append", default=[], help="KEY=JSON")
@@ -83,6 +106,13 @@ def parse_args(parser):
     for opt in sorted(ROLE_OPTIONS[other]):
         if getattr(args, opt) is not None:
             parser.error(f"--{opt.replace('_', '-')} is a {other} option")
+    if args.variant != "default" and args.variant not in role_variants(
+        args.variants_file, args.role
+    ):
+        parser.error(f"--variant={args.variant} is not a {args.role} variant")
+    share = args.key_share
+    if share not in (None, "empty", "default") and share not in args.groups.split(","):
+        parser.error(f"--key-share={share} is not in --groups")
     return args
 
 

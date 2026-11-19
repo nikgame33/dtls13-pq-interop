@@ -27,6 +27,7 @@ def install(
     adapter = impl_dir / "run"
     echo = shlex.join([sys.executable, str(ECHO_ADAPTER)])
     # exec keeps the adapter's pid, so the runner's process group handling is exercised as-is.
+    flags = (f"--variants-file={impl_dir / VARIANTS_FILE}", *flags)
     adapter.write_text(f'#!/bin/sh\nexec {echo} "$@" {shlex.join(flags)}\n')
     adapter.chmod(0o755)
     prefix = root / "build" / name
