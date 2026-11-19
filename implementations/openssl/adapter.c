@@ -1,50 +1,82 @@
 /* DTLS 1.3 interop adapter for OpenSSL, implementing docs/shim-interface.md. */
 #define _POSIX_C_SOURCE 200809L
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
-#include <openssl/pem.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 
-enum { EXIT_OK = 0, EXIT_FAIL = 1, EXIT_UNSUPPORTED = 2 };
+enum { EXIT_OK = 0, EXIT_FAIL = 1, EXIT_UNSUPPORTED = 2, EXIT_USAGE = 64 };
 
 #define SERVER_NAME "localhost"
-#define TICKET_KEYS_LEN 80
 #define MAX_GROUPS 16
-#define LINGER_SECONDS 2
+#define TEARDOWN_MS 2000
 /* --mtu is the IP path MTU; the contract reserves IPv6 + UDP headers for every address family. */
 #define IP_UDP_OVERHEAD 48
+#define LISTENER_DEFAULT_MAX_DGRAM 2000
 
-struct options {
-    const char *role;
-    const char *host;
-    const char *port;
-    const char *groups;
-    const char *key_share;
-    const char *validate;
-    const char *cert;
-    const char *key;
-    const char *ca;
-    const char *psk_in;
-    const char *psk_out;
-    long mtu;
-    long payload; /* largest UDP payload: mtu - IP_UDP_OVERHEAD, or 0 if --mtu is absent */
+/* Bits stored in the SSL's ex_data once a HelloRetryRequest was sent or received. */
+enum { HRR_SEEN = 1, HRR_COOKIE = 2, HRR_GROUP = 4 };
+
+enum { OPT_ROLE, OPT_VARIANT, OPT_HOST, OPT_PORT, OPT_GROUPS, OPT_MTU, OPT_CA, OPT_KEY_SHARE,
+    OPT_VALIDATE, OPT_CERT, OPT_KEY, OPT_COUNT };
+
+static const struct option LONGOPTS[] = {
+    { "role", required_argument, NULL, OPT_ROLE },
+    { "variant", required_argument, NULL, OPT_VARIANT },
+    { "host", required_argument, NULL, OPT_HOST },
+    { "port", required_argument, NULL, OPT_PORT },
+    { "groups", required_argument, NULL, OPT_GROUPS },
+    { "mtu", required_argument, NULL, OPT_MTU },
+    { "ca", required_argument, NULL, OPT_CA },
+    { "key-share", required_argument, NULL, OPT_KEY_SHARE },
+    { "validate", required_argument, NULL, OPT_VALIDATE },
+    { "cert", required_argument, NULL, OPT_CERT },
+    { "key", required_argument, NULL, OPT_KEY },
+    { NULL, 0, NULL, 0 },
 };
 
-static const struct options *g_opts;
+static const bool CLIENT_OPT[OPT_COUNT] = {
+    [OPT_ROLE] = true, [OPT_VARIANT] = true, [OPT_HOST] = true, [OPT_PORT] = true,
+    [OPT_GROUPS] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_KEY_SHARE] = true,
+};
+static const bool SERVER_OPT[OPT_COUNT] = {
+    [OPT_ROLE] = true, [OPT_VARIANT] = true, [OPT_HOST] = true, [OPT_PORT] = true,
+    [OPT_GROUPS] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_VALIDATE] = true,
+    [OPT_CERT] = true, [OPT_KEY] = true,
+};
+
+struct options {
+    const char *val[OPT_COUNT];
+    bool server;
+    bool accept_variant; /* --variant=accept: SSL_accept on a connected socket, no listener */
+    bool cookie;
+    long mtu;
+    long payload; /* largest UDP payload: mtu - IP_UDP_OVERHEAD, or 0 for --mtu=default */
+};
+
+static struct options g_opts;
 static int g_hrr_idx = -1;
-static bool g_session_saved;
+static unsigned char g_cookie_key[32];
+static struct sockaddr_storage g_peer;
+static socklen_t g_peer_len;
 
 /* SHA-256("HelloRetryRequest"), RFC 9846 section 4.2.3. */
 static const unsigned char HRR_RANDOM[32] = {
@@ -89,20 +121,27 @@ static const char *iana_group_name(const char *name)
     return name;
 }
 
-static bool hrr_seen(SSL *ssl)
+static void json_bool(bool known, bool value)
 {
-    return ssl != NULL && SSL_get_ex_data(ssl, g_hrr_idx) != NULL;
+    fputs(!known ? "null" : value ? "true" : "false", stdout);
 }
 
 /* Emits the result line and returns `code` so callers can `return finish(...)`. */
 static int finish(int code, SSL *ssl, bool handshake_done, const char *error)
 {
+    bool known = ssl != NULL && code != EXIT_UNSUPPORTED && code != EXIT_USAGE;
+    intptr_t hrr = known ? (intptr_t)SSL_get_ex_data(ssl, g_hrr_idx) : 0;
+
     printf("{\"event\": \"result\", \"ok\": %s, \"version\": ", code == EXIT_OK ? "true" : "false");
     json_string(handshake_done ? SSL_get_version(ssl) : NULL);
     fputs(", \"group\": ", stdout);
     json_string(handshake_done ? iana_group_name(SSL_get0_group_name(ssl)) : NULL);
     fputs(", \"hrr\": ", stdout);
-    fputs(code == EXIT_UNSUPPORTED || ssl == NULL ? "null" : hrr_seen(ssl) ? "true" : "false", stdout);
+    json_bool(known, hrr & HRR_SEEN);
+    fputs(", \"hrr_cookie\": ", stdout);
+    json_bool(known, hrr & HRR_COOKIE);
+    fputs(", \"hrr_group\": ", stdout);
+    json_bool(known, hrr & HRR_GROUP);
     fputs(", \"error\": ", stdout);
     json_string(error);
     puts("}");
@@ -157,11 +196,39 @@ static const char *hs_name(unsigned char type)
     }
 }
 
+static unsigned read_u16(const unsigned char *p)
+{
+    return (unsigned)p[0] << 8 | p[1];
+}
+
+/* Walks the HRR extensions (RFC 9846 section 4.2.3 layout) for cookie and key_share. */
+static intptr_t hrr_flags(const unsigned char *p, size_t len)
+{
+    size_t off = DTLS1_HM_HEADER_LENGTH + 2 + sizeof(HRR_RANDOM), end;
+    intptr_t flags = HRR_SEEN;
+
+    if (off >= len)
+        return flags;
+    off += 1 + p[off] + 2 + 1; /* session id echo, cipher suite, compression */
+    if (off + 2 > len)
+        return flags;
+    end = off + 2 + read_u16(p + off);
+    end = end < len ? end : len;
+    for (off += 2; off + 4 <= end; off += 4 + read_u16(p + off + 2)) {
+        if (read_u16(p + off) == TLSEXT_TYPE_cookie)
+            flags |= HRR_COOKIE;
+        else if (read_u16(p + off) == TLSEXT_TYPE_key_share)
+            flags |= HRR_GROUP;
+    }
+    return flags;
+}
+
 /* DTLS handshake buffers start with the 12-byte header; HRR is a ServerHello with a fixed random. */
 static void msg_cb(int write_p, int version, int content_type, const void *buf, size_t len,
     SSL *ssl, void *arg)
 {
     const unsigned char *p = buf;
+    const char *dir = write_p ? ">>" : "<<";
     bool hrr;
 
     (void)version;
@@ -169,36 +236,39 @@ static void msg_cb(int write_p, int version, int content_type, const void *buf, 
     /* Plaintext (epoch 0) record headers show how ClientHello and ServerHello were fragmented. */
     if (content_type == SSL3_RT_HEADER && len == DTLS1_RT_HEADER_LENGTH
         && p[0] == SSL3_RT_HANDSHAKE) {
-        fprintf(stderr, "%s plaintext handshake record (%d bytes)\n", write_p ? ">>" : "<<",
-            (p[11] << 8) | p[12]);
+        fprintf(stderr, "%s plaintext handshake record (%u bytes)\n", dir, read_u16(p + 11));
         return;
     }
     if (content_type == SSL3_RT_ACK) {
-        fprintf(stderr, "%s ACK (%zu bytes)\n", write_p ? ">>" : "<<", len);
+        fprintf(stderr, "%s ACK (%zu bytes)\n", dir, len);
         return;
     }
     if (content_type == SSL3_RT_ALERT && len == 2) {
-        fprintf(stderr, "%s alert %s\n", write_p ? ">>" : "<<",
-            SSL_alert_desc_string_long(p[1]));
+        fprintf(stderr, "%s alert %s\n", dir, SSL_alert_desc_string_long(p[1]));
         return;
     }
     if (content_type != SSL3_RT_HANDSHAKE || len < 1)
         return;
     hrr = p[0] == SSL3_MT_SERVER_HELLO && len >= DTLS1_HM_HEADER_LENGTH + 2 + sizeof(HRR_RANDOM)
         && memcmp(p + DTLS1_HM_HEADER_LENGTH + 2, HRR_RANDOM, sizeof(HRR_RANDOM)) == 0;
-    if (hrr)
-        SSL_set_ex_data(ssl, g_hrr_idx, (void *)1);
-    fprintf(stderr, "%s %s (%zu bytes)\n", write_p ? ">>" : "<<",
-        hrr ? "HelloRetryRequest" : hs_name(p[0]), len);
+    if (hrr) {
+        intptr_t flags = hrr_flags(p, len);
+
+        SSL_set_ex_data(ssl, g_hrr_idx, (void *)flags);
+        fprintf(stderr, "%s HelloRetryRequest (%zu bytes, cookie=%d, selected_group=%d)\n", dir,
+            len, (flags & HRR_COOKIE) != 0, (flags & HRR_GROUP) != 0);
+        return;
+    }
+    fprintf(stderr, "%s %s (%zu bytes)\n", dir, hs_name(p[0]), len);
 }
 
 /* SSL_set_mtu takes the UDP payload size (DTLS_set_link_mtu would subtract only 28 on IPv4). */
 static bool set_mtu(SSL *ssl)
 {
-    if (g_opts->payload == 0)
+    if (g_opts.payload == 0)
         return true;
     SSL_set_options(ssl, SSL_OP_NO_QUERY_MTU);
-    return SSL_set_mtu(ssl, g_opts->payload) > 0;
+    return SSL_set_mtu(ssl, g_opts.payload) > 0;
 }
 
 /* Listener connections are created internally, so per-connection MTU is set once CH1 arrives. */
@@ -212,7 +282,7 @@ static int client_hello_cb(SSL *ssl, int *alert, void *arg)
     return SSL_CLIENT_HELLO_SUCCESS;
 }
 
-/* Logs every UDP datagram sent: BIO_write on the client, BIO_sendmmsg from listener connections. */
+/* Logs every UDP datagram sent: BIO_write on connected sockets, BIO_sendmmsg from the listener. */
 static long datagram_cb(BIO *b, int oper, const char *argp, size_t len, int argi, long argl,
     int ret, size_t *processed)
 {
@@ -230,32 +300,39 @@ static long datagram_cb(BIO *b, int oper, const char *argp, size_t len, int argi
     return ret;
 }
 
-static int new_session_cb(SSL *ssl, SSL_SESSION *sess)
+/* accept variant: the HRR cookie binds the peer address, as the listener's cookie does. */
+static bool peer_mac(unsigned char *out, size_t *out_len)
 {
-    FILE *f = fopen(g_opts->psk_out, "w");
+    return EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, g_cookie_key, sizeof(g_cookie_key),
+               (const unsigned char *)&g_peer, g_peer_len, out, 32, out_len)
+        != NULL;
+}
+
+static int gen_cookie_cb(SSL *ssl, unsigned char *cookie, size_t *cookie_len)
+{
+    (void)ssl;
+    return peer_mac(cookie, cookie_len);
+}
+
+static int verify_cookie_cb(SSL *ssl, const unsigned char *cookie, size_t cookie_len)
+{
+    unsigned char mac[32];
+    size_t n;
 
     (void)ssl;
-    if (f == NULL || !PEM_write_SSL_SESSION(f, sess)) {
-        fprintf(stderr, "error: cannot write session to %s\n", g_opts->psk_out);
-    } else {
-        g_session_saved = true;
-        fprintf(stderr, "session ticket saved to %s\n", g_opts->psk_out);
-    }
-    if (f != NULL)
-        fclose(f);
-    return 0;
+    return peer_mac(mac, &n) && cookie_len == n && CRYPTO_memcmp(mac, cookie, n) == 0;
 }
 
 /* Rejects groups this build lacks (exit 2) and sets the OpenSSL group list.
  * Returns EXIT_OK, or the exit code after emitting a result line. */
-static int configure_groups(SSL_CTX *ctx, bool server)
+static int configure_groups(SSL_CTX *ctx)
 {
     char *names[MAX_GROUPS];
     size_t n = 0;
     char list[1024] = "";
-    char *copy = strdup(g_opts->groups);
+    char *copy = strdup(g_opts.val[OPT_GROUPS]);
+    const char *share = g_opts.server ? "default" : g_opts.val[OPT_KEY_SHARE];
     STACK_OF(OPENSSL_CSTRING) *impl = sk_OPENSSL_CSTRING_new_null();
-    bool share_found = false;
     int rc = EXIT_OK;
 
     if (copy == NULL || impl == NULL || !SSL_CTX_get0_implemented_groups(ctx, 1, impl)) {
@@ -272,40 +349,91 @@ static int configure_groups(SSL_CTX *ctx, bool server)
                 OpenSSL_version(OPENSSL_VERSION));
             goto out;
         }
-        if (n == MAX_GROUPS) {
-            rc = fail_msg(EXIT_FAIL, NULL, "too many groups");
-            goto out;
-        }
         names[n++] = tok;
     }
+    /* One tuple: the server takes its best group among the client's shares, else HRR. */
     for (size_t i = 0; i < n; i++) {
-        /* Server: one tuple per group, so the first mutually supported group wins (via HRR). */
-        const char *sep = i == 0 ? "" : server ? "/" : ":";
-        bool share = !server && g_opts->key_share != NULL
-            && strcasecmp(names[i], g_opts->key_share) == 0;
+        bool star = strcasecmp(names[i], share) == 0;
 
-        share_found = share_found || share;
-        if (strlen(list) + strlen(sep) + strlen(names[i]) + 2 >= sizeof(list)) {
-            rc = fail_msg(EXIT_FAIL, NULL, "group list too long");
+        if (strlen(list) + strlen(names[i]) + 3 >= sizeof(list)) {
+            rc = fail_msg(EXIT_USAGE, NULL, "group list too long");
             goto out;
         }
-        strcat(list, sep);
-        strcat(list, share ? "*" : "");
+        strcat(list, i == 0 ? "" : ":");
+        strcat(list, star ? "*" : "");
         strcat(list, names[i]);
-    }
-    if (!server && g_opts->key_share != NULL && !share_found) {
-        rc = fail_msg(EXIT_FAIL, NULL, "--key-share %s is not in --groups", g_opts->key_share);
-        goto out;
     }
     fprintf(stderr, "groups list: %s\n", list);
     if (!SSL_CTX_set1_groups_list(ctx, list))
         rc = fail_ssl(NULL, 0, "SSL_CTX_set1_groups_list");
-    else if (server)
+    else if (g_opts.server)
         SSL_CTX_set_options(ctx, SSL_OP_SERVER_PREFERENCE);
 out:
     sk_OPENSSL_CSTRING_free(impl);
     free(copy);
     return rc;
+}
+
+static long ms_until(const struct timespec *deadline)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (deadline->tv_sec - now.tv_sec) * 1000 + (deadline->tv_nsec - now.tv_nsec) / 1000000;
+}
+
+/* fd < 0 means a listener connection, which only SSL_poll can wait on. */
+static bool wait_readable(SSL *ssl, int fd, long ms)
+{
+    if (ms <= 0)
+        return false;
+    if (fd >= 0) {
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+
+        return poll(&p, 1, (int)ms) > 0;
+    } else {
+        SSL_POLL_ITEM item = { .desc = SSL_as_poll_descriptor(ssl), .events = SSL_POLL_EVENT_R };
+        struct timeval tv = { .tv_sec = ms / 1000, .tv_usec = (ms % 1000) * 1000 };
+        size_t ready = 0;
+
+        return SSL_poll(&item, 1, sizeof(item), &tv, 0, &ready) && ready > 0;
+    }
+}
+
+/* Waits up to TEARDOWN_MS for the peer's close_notify. After our own close_notify DTLS drops
+ * other records, so SSL_shutdown is the reader; before it, SSL_read is. Errors only go to stderr. */
+static void await_close_notify(SSL *ssl, int fd, bool sent_ours)
+{
+    struct timespec deadline;
+    char buf[64];
+    size_t n;
+    int ret, err;
+
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += TEARDOWN_MS / 1000;
+    if (!(fd >= 0 ? BIO_socket_nbio(fd, 1) : SSL_set_blocking_mode(ssl, 0)))
+        return;
+    for (;;) {
+        ret = sent_ours ? SSL_shutdown(ssl) : SSL_read_ex(ssl, buf, sizeof(buf), &n);
+        if (sent_ours && ret == 1)
+            break;
+        err = SSL_get_error(ssl, ret);
+        if (!sent_ours && (ret == 1 || err == SSL_ERROR_WANT_WRITE))
+            continue;
+        if (err == SSL_ERROR_ZERO_RETURN)
+            break;
+        if (err != SSL_ERROR_WANT_READ) {
+            fprintf(stderr, "teardown: SSL_get_error=%d\n", err);
+            ERR_print_errors_fp(stderr);
+            break;
+        }
+        if (!wait_readable(ssl, fd, ms_until(&deadline))) {
+            fprintf(stderr, "teardown: no close_notify within %d ms\n", TEARDOWN_MS);
+            break;
+        }
+    }
+    fprintf(stderr, "teardown done\n");
+    ERR_clear_error();
 }
 
 static int run_client(SSL_CTX *ctx)
@@ -318,17 +446,8 @@ static int run_client(SSL_CTX *ctx)
     size_t n;
     char buf[64];
 
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-    if (!SSL_CTX_load_verify_locations(ctx, g_opts->ca, NULL))
-        return fail_ssl(NULL, 0, "loading --ca");
-    if (g_opts->psk_out != NULL) {
-        SSL_CTX_set_session_cache_mode(ctx,
-            SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
-        SSL_CTX_sess_set_new_cb(ctx, new_session_cb);
-    }
-
-    if (!BIO_lookup_ex(g_opts->host, g_opts->port, BIO_LOOKUP_CLIENT, AF_UNSPEC, SOCK_DGRAM, 0,
-            &res))
+    if (!BIO_lookup_ex(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], BIO_LOOKUP_CLIENT, AF_UNSPEC,
+            SOCK_DGRAM, 0, &res))
         return fail_ssl(NULL, 0, "resolving --host");
     for (ai = res; ai != NULL; ai = BIO_ADDRINFO_next(ai)) {
         fd = BIO_socket(BIO_ADDRINFO_family(ai), SOCK_DGRAM, 0, 0);
@@ -350,160 +469,136 @@ static int run_client(SSL_CTX *ctx)
     BIO_set_callback_ex(bio, datagram_cb);
     SSL_set_bio(ssl, bio, bio);
     if (!set_mtu(ssl))
-        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu %ld rejected by SSL_set_mtu(%ld)",
-            g_opts->mtu, g_opts->payload);
+        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu=%ld rejected by SSL_set_mtu(%ld)",
+            g_opts.mtu, g_opts.payload);
     if (!SSL_set1_dnsname(ssl, SERVER_NAME) || !SSL_set_tlsext_host_name(ssl, SERVER_NAME))
         return fail_ssl(ssl, 0, "setting server name");
-    if (g_opts->psk_in != NULL) {
-        FILE *f = fopen(g_opts->psk_in, "r");
-        SSL_SESSION *sess = f != NULL ? PEM_read_SSL_SESSION(f, NULL, NULL, NULL) : NULL;
-
-        if (f != NULL)
-            fclose(f);
-        if (sess == NULL || !SSL_set_session(ssl, sess))
-            return fail_msg(EXIT_FAIL, ssl, "cannot load session from %s", g_opts->psk_in);
-        SSL_SESSION_free(sess);
-    }
 
     if ((ret = SSL_connect(ssl)) != 1)
         return fail_ssl(ssl, ret, "handshake");
-    fprintf(stderr, "handshake done: %s %s resumed=%d\n", SSL_get_version(ssl),
-        SSL_get0_group_name(ssl), SSL_session_reused(ssl));
-
+    fprintf(stderr, "handshake done: %s %s\n", SSL_get_version(ssl), SSL_get0_group_name(ssl));
     if ((ret = SSL_write_ex(ssl, "ping", 4, &n)) != 1)
         return fail_ssl(ssl, ret, "writing ping");
     if ((ret = SSL_read_ex(ssl, buf, sizeof(buf), &n)) != 1)
         return fail_ssl(ssl, ret, "reading pong");
     if (n != 4 || memcmp(buf, "pong", 4) != 0)
         return fail_msg(EXIT_FAIL, ssl, "unexpected echo (%zu bytes)", n);
-    if (g_opts->psk_out != NULL && !g_session_saved)
-        return fail_msg(EXIT_FAIL, ssl, "no session ticket received for --psk-out");
-    /* The server may already be gone; close_notify is best effort. */
-    SSL_shutdown(ssl);
+
+    /* The verdict is final after pong; teardown problems are only logged. */
+    if (SSL_shutdown(ssl) < 0)
+        fprintf(stderr, "teardown: sending close_notify failed\n");
+    else
+        await_close_notify(ssl, fd, true);
     ERR_clear_error();
     rc = finish(EXIT_OK, ssl, true, NULL);
     SSL_free(ssl);
     return rc;
 }
 
-static int ticket_keys(SSL_CTX *ctx)
+static int bind_server_socket(void)
 {
-    unsigned char keys[TICKET_KEYS_LEN];
-    FILE *f;
+    BIO_ADDRINFO *res = NULL;
+    struct sockaddr_storage addr;
+    socklen_t len = sizeof(addr);
+    int fd;
 
-    if (g_opts->psk_in != NULL) {
-        f = fopen(g_opts->psk_in, "rb");
-        if (f == NULL || fread(keys, 1, sizeof(keys), f) != sizeof(keys)
-            || !SSL_CTX_set_tlsext_ticket_keys(ctx, keys, sizeof(keys))) {
-            if (f != NULL)
-                fclose(f);
-            return fail_msg(EXIT_FAIL, NULL, "cannot load ticket keys from %s", g_opts->psk_in);
-        }
-        fclose(f);
+    if (!BIO_lookup_ex(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], BIO_LOOKUP_SERVER, AF_UNSPEC,
+            SOCK_DGRAM, 0, &res))
+        return -1;
+    fd = BIO_socket(BIO_ADDRINFO_family(res), SOCK_DGRAM, 0, 0);
+    if (fd != -1 && !BIO_bind(fd, BIO_ADDRINFO_address(res), 0)) {
+        BIO_closesocket(fd);
+        fd = -1;
     }
-    if (g_opts->psk_out != NULL) {
-        f = fopen(g_opts->psk_out, "wb");
-        if (f == NULL || !SSL_CTX_get_tlsext_ticket_keys(ctx, keys, sizeof(keys))
-            || fwrite(keys, 1, sizeof(keys), f) != sizeof(keys)) {
-            if (f != NULL)
-                fclose(f);
-            return fail_msg(EXIT_FAIL, NULL, "cannot write ticket keys to %s", g_opts->psk_out);
-        }
-        fclose(f);
-    }
-    return EXIT_OK;
+    BIO_ADDRINFO_free(res);
+    if (fd == -1 || getsockname(fd, (struct sockaddr *)&addr, &len) != 0)
+        return -1;
+    printf("{\"event\": \"ready\", \"port\": %u}\n",
+        ntohs(addr.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&addr)->sin6_port
+                                         : ((struct sockaddr_in *)&addr)->sin_port));
+    fflush(stdout);
+    return fd;
 }
 
-/* Exiting early makes the client's ticket ACKs hit a closed port; Linux reports that ICMP error
- * before queued data, losing the pong. Before our close_notify: DTLS drops records after it. */
-static void linger_for_close_notify(SSL *conn)
+/* Default variant: the DTLS listener, which validates new peers itself unless told not to. */
+static SSL *accept_with_listener(SSL_CTX *ctx, int fd, SSL **listener)
 {
-    SSL_POLL_ITEM item = { .desc = SSL_as_poll_descriptor(conn), .events = SSL_POLL_EVENT_R };
-    struct timeval timeout = { .tv_sec = LINGER_SECONDS };
-    char buf[64];
-    size_t n, ready;
-    int ret, err;
+    uint64_t flags = SSL_LISTENER_FLAG_SINGLE_THREAD;
+    BIO *bio = BIO_new_dgram(fd, BIO_CLOSE);
 
-    if (!SSL_set_blocking_mode(conn, 0))
-        return;
-    for (;;) {
-        ret = SSL_read_ex(conn, buf, sizeof(buf), &n);
-        err = SSL_get_error(conn, ret);
-        if (ret == 1 || err == SSL_ERROR_WANT_WRITE)
-            continue;
-        if (err == SSL_ERROR_ZERO_RETURN)
-            break;
-        if (err != SSL_ERROR_WANT_READ) {
-            fprintf(stderr, "waiting for close_notify: SSL_get_error=%d\n", err);
-            ERR_print_errors_fp(stderr);
-            break;
-        }
-        if (!SSL_poll(&item, 1, sizeof(item), &timeout, 0, &ready) || ready == 0) {
-            fprintf(stderr, "no close_notify from client within %ds\n", LINGER_SECONDS);
-            break;
-        }
+    if (!g_opts.cookie)
+        flags |= SSL_LISTENER_FLAG_NO_VALIDATE;
+    *listener = SSL_new_listener(ctx, flags);
+    if (bio == NULL || *listener == NULL)
+        return NULL;
+    BIO_set_callback_ex(bio, datagram_cb);
+    SSL_set_bio(*listener, bio, bio);
+    if (g_opts.payload > LISTENER_DEFAULT_MAX_DGRAM
+        && !SSL_set_generic_value_uint(*listener, SSL_VALUE_DTLS_LISTENER_MAX_DGRAM_SIZE,
+            (uint64_t)g_opts.payload))
+        return NULL;
+    if (SSL_listen(*listener) != 1)
+        return NULL;
+    return SSL_accept_connection(*listener, 0);
+}
+
+/* accept variant: connect the socket to the first peer and run a plain SSL_accept on it. */
+static SSL *accept_connected(SSL_CTX *ctx, int fd)
+{
+    unsigned char byte;
+    BIO *bio;
+    SSL *ssl;
+
+    g_peer_len = sizeof(g_peer);
+    if (recvfrom(fd, &byte, 1, MSG_PEEK, (struct sockaddr *)&g_peer, &g_peer_len) < 0
+        || connect(fd, (struct sockaddr *)&g_peer, g_peer_len) != 0) {
+        ERR_raise_data(ERR_LIB_SYS, errno, "waiting for the first datagram");
+        return NULL;
     }
-    ERR_clear_error();
+    bio = BIO_new_dgram(fd, BIO_CLOSE);
+    ssl = SSL_new(ctx);
+    if (bio == NULL || ssl == NULL)
+        return NULL;
+    BIO_set_callback_ex(bio, datagram_cb);
+    SSL_set_bio(ssl, bio, bio);
+    if (g_opts.cookie)
+        SSL_set_options(ssl, SSL_OP_COOKIE_EXCHANGE);
+    return set_mtu(ssl) ? ssl : NULL;
 }
 
 static int run_server(SSL_CTX *ctx)
 {
-    BIO_ADDRINFO *res = NULL;
-    uint64_t flags = SSL_LISTENER_FLAG_SINGLE_THREAD;
-    SSL *probe, *listener, *conn;
+    SSL *probe, *listener = NULL, *conn;
     int fd, ret, rc;
-    BIO *bio;
     size_t n;
     char buf[64];
 
-    if (SSL_CTX_use_certificate_chain_file(ctx, g_opts->cert) != 1
-        || SSL_CTX_use_PrivateKey_file(ctx, g_opts->key, SSL_FILETYPE_PEM) != 1
+    if (SSL_CTX_use_certificate_chain_file(ctx, g_opts.val[OPT_CERT]) != 1
+        || SSL_CTX_use_PrivateKey_file(ctx, g_opts.val[OPT_KEY], SSL_FILETYPE_PEM) != 1
         || SSL_CTX_check_private_key(ctx) != 1)
         return fail_ssl(NULL, 0, "loading --cert/--key");
-    if ((rc = ticket_keys(ctx)) != EXIT_OK)
-        return rc;
     /* Reject an MTU the library refuses before announcing readiness. */
     probe = SSL_new(ctx);
     if (probe == NULL || !set_mtu(probe))
-        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu %ld rejected by SSL_set_mtu(%ld)",
-            g_opts->mtu, g_opts->payload);
+        return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu=%ld rejected by SSL_set_mtu(%ld)",
+            g_opts.mtu, g_opts.payload);
     SSL_free(probe);
     SSL_CTX_set_client_hello_cb(ctx, client_hello_cb, NULL);
-
-    if (strcmp(g_opts->validate, "off") == 0)
-        flags |= SSL_LISTENER_FLAG_NO_VALIDATE;
-    if (!BIO_lookup_ex(g_opts->host, g_opts->port, BIO_LOOKUP_SERVER, AF_UNSPEC, SOCK_DGRAM, 0,
-            &res))
-        return fail_ssl(NULL, 0, "resolving --host");
-    fd = BIO_socket(BIO_ADDRINFO_family(res), SOCK_DGRAM, 0, 0);
-    if (fd == -1 || !BIO_bind(fd, BIO_ADDRINFO_address(res), 0)) {
-        BIO_ADDRINFO_free(res);
-        return fail_ssl(NULL, 0, "binding UDP socket");
+    if (g_opts.accept_variant) {
+        if (RAND_bytes(g_cookie_key, sizeof(g_cookie_key)) != 1)
+            return fail_ssl(NULL, 0, "generating cookie key");
+        SSL_CTX_set_stateless_cookie_generate_cb(ctx, gen_cookie_cb);
+        SSL_CTX_set_stateless_cookie_verify_cb(ctx, verify_cookie_cb);
     }
-    BIO_ADDRINFO_free(res);
 
-    bio = BIO_new_dgram(fd, BIO_CLOSE);
-    listener = SSL_new_listener(ctx, flags);
-    if (bio == NULL || listener == NULL)
-        return fail_ssl(NULL, 0, "creating DTLS listener");
-    BIO_set_callback_ex(bio, datagram_cb);
-    SSL_set_bio(listener, bio, bio);
-    if (g_opts->payload > 2000
-        && !SSL_set_generic_value_uint(listener, SSL_VALUE_DTLS_LISTENER_MAX_DGRAM_SIZE,
-            (uint64_t)g_opts->payload))
-        return fail_ssl(NULL, 0, "raising listener datagram size");
-    if (SSL_listen(listener) != 1)
-        return fail_ssl(NULL, 0, "SSL_listen");
-    puts("{\"event\": \"ready\"}");
-    fflush(stdout);
-
-    conn = SSL_accept_connection(listener, 0);
+    if ((fd = bind_server_socket()) == -1)
+        return fail_ssl(NULL, 0, "binding UDP socket");
+    conn = g_opts.accept_variant ? accept_connected(ctx, fd) : accept_with_listener(ctx, fd, &listener);
     if (conn == NULL)
-        return fail_ssl(NULL, 0, "SSL_accept_connection");
+        return fail_ssl(NULL, 0, "accepting a connection");
     if ((ret = SSL_accept(conn)) != 1)
         return fail_ssl(conn, ret, "handshake");
-    fprintf(stderr, "handshake done: %s %s resumed=%d\n", SSL_get_version(conn),
-        SSL_get0_group_name(conn), SSL_session_reused(conn));
+    fprintf(stderr, "handshake done: %s %s\n", SSL_get_version(conn), SSL_get0_group_name(conn));
 
     if ((ret = SSL_read_ex(conn, buf, sizeof(buf), &n)) != 1)
         return fail_ssl(conn, ret, "reading ping");
@@ -511,8 +606,9 @@ static int run_server(SSL_CTX *ctx)
         return fail_msg(EXIT_FAIL, conn, "unexpected message (%zu bytes)", n);
     if ((ret = SSL_write_ex(conn, "pong", 4, &n)) != 1)
         return fail_ssl(conn, ret, "writing pong");
-    linger_for_close_notify(conn);
-    SSL_shutdown(conn);
+    await_close_notify(conn, g_opts.accept_variant ? fd : -1, false);
+    if (SSL_shutdown(conn) < 0)
+        fprintf(stderr, "teardown: sending close_notify failed\n");
     ERR_clear_error();
     rc = finish(EXIT_OK, conn, true, NULL);
     SSL_free(conn);
@@ -520,93 +616,148 @@ static int run_server(SSL_CTX *ctx)
     return rc;
 }
 
-static int usage(const char *msg)
+static int usage(const char *fmt, const char *arg)
 {
+    char msg[256];
+
+    snprintf(msg, sizeof(msg), fmt, arg);
     fprintf(stderr,
-        "usage: run --role client|server --host HOST --port PORT --groups G1[,G2...]\n"
-        "           [--key-share GROUP|empty] [--mtu N] [--validate off|cookie]\n"
-        "           [--cert FILE] [--key FILE] [--ca FILE] [--psk-in FILE] [--psk-out FILE]\n");
-    return fail_msg(EXIT_FAIL, NULL, "usage: %s", msg);
+        "usage: run --role=client --variant=default|accept --host=HOST --port=PORT\n"
+        "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --key-share=GROUP|empty|default\n"
+        "       run --role=server --variant=default|accept --host=HOST --port=PORT\n"
+        "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --validate=off|cookie\n"
+        "           --cert=FILE --key=FILE\n");
+    return fail_msg(EXIT_USAGE, NULL, "usage: %s", msg);
+}
+
+static bool in_list(const char *word, const char *list)
+{
+    size_t len = strlen(word);
+
+    for (const char *p = list; *p != '\0'; p += strcspn(p, ",") + (p[strcspn(p, ",")] == ',')) {
+        if (strcspn(p, ",") == len && strncasecmp(p, word, len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool valid_groups(const char *s)
+{
+    size_t count = 1;
+
+    if (*s == '\0' || *s == ',' || s[strlen(s) - 1] == ',' || strstr(s, ",,") != NULL)
+        return false;
+    for (; *s != '\0'; s++)
+        count += *s == ',';
+    return count <= MAX_GROUPS;
+}
+
+/* Every option of the role is required; anything missing, foreign, repeated or malformed is 64. */
+static int parse_options(int argc, char **argv)
+{
+    const bool *allowed;
+    const char *v;
+    char *end;
+    long port;
+    int c;
+
+    opterr = 0;
+    while ((c = getopt_long(argc, argv, "", LONGOPTS, NULL)) != -1) {
+        if (c < 0 || c >= OPT_COUNT)
+            return usage("unknown option or missing value: %s", argv[optind - 1]);
+        if (g_opts.val[c] != NULL)
+            return usage("--%s given twice", LONGOPTS[c].name);
+        g_opts.val[c] = optarg;
+    }
+    if (optind != argc)
+        return usage("unexpected argument %s", argv[optind]);
+    if ((v = g_opts.val[OPT_ROLE]) == NULL || (strcmp(v, "client") != 0 && strcmp(v, "server") != 0))
+        return usage("--role must be client or server", NULL);
+    g_opts.server = strcmp(v, "server") == 0;
+    allowed = g_opts.server ? SERVER_OPT : CLIENT_OPT;
+    for (int i = 0; i < OPT_COUNT; i++) {
+        if (allowed[i] && g_opts.val[i] == NULL)
+            return usage("--%s is required", LONGOPTS[i].name);
+        if (!allowed[i] && g_opts.val[i] != NULL)
+            return usage("--%s is not an option of this role", LONGOPTS[i].name);
+    }
+
+    v = g_opts.val[OPT_VARIANT];
+    if (strcmp(v, "default") != 0 && strcmp(v, "accept") != 0)
+        return usage("unknown --variant=%s", v);
+    g_opts.accept_variant = strcmp(v, "accept") == 0;
+    if (*g_opts.val[OPT_HOST] == '\0')
+        return usage("--host must not be empty", NULL);
+    errno = 0;
+    port = strtol(g_opts.val[OPT_PORT], &end, 10);
+    if (errno != 0 || *g_opts.val[OPT_PORT] == '\0' || *end != '\0' || port < !g_opts.server
+        || port > 65535)
+        return usage("malformed --port=%s", g_opts.val[OPT_PORT]);
+    if (!valid_groups(g_opts.val[OPT_GROUPS]))
+        return usage("malformed --groups=%s", g_opts.val[OPT_GROUPS]);
+    if (strcmp(g_opts.val[OPT_MTU], "default") != 0) {
+        errno = 0;
+        g_opts.mtu = strtol(g_opts.val[OPT_MTU], &end, 10);
+        if (errno != 0 || *end != '\0' || g_opts.mtu <= IP_UDP_OVERHEAD)
+            return usage("--mtu=%s must be default or an integer above 48", g_opts.val[OPT_MTU]);
+        g_opts.payload = g_opts.mtu - IP_UDP_OVERHEAD;
+    }
+    for (int i = OPT_CA; i < OPT_COUNT; i++) {
+        if (g_opts.val[i] != NULL && *g_opts.val[i] == '\0')
+            return usage("--%s must not be empty", LONGOPTS[i].name);
+    }
+    if (g_opts.server) {
+        v = g_opts.val[OPT_VALIDATE];
+        if (strcmp(v, "off") != 0 && strcmp(v, "cookie") != 0)
+            return usage("--validate must be off or cookie", NULL);
+        g_opts.cookie = strcmp(v, "cookie") == 0;
+    } else {
+        v = g_opts.val[OPT_KEY_SHARE];
+        if (strcmp(v, "empty") != 0 && strcmp(v, "default") != 0
+            && !in_list(v, g_opts.val[OPT_GROUPS]))
+            return usage("--key-share=%s is not in --groups", v);
+    }
+    return EXIT_OK;
 }
 
 int main(int argc, char **argv)
 {
-    static const struct option longopts[] = {
-        { "role", required_argument, NULL, 'r' },
-        { "host", required_argument, NULL, 'h' },
-        { "port", required_argument, NULL, 'p' },
-        { "groups", required_argument, NULL, 'g' },
-        { "key-share", required_argument, NULL, 's' },
-        { "mtu", required_argument, NULL, 'm' },
-        { "validate", required_argument, NULL, 'v' },
-        { "cert", required_argument, NULL, 'c' },
-        { "key", required_argument, NULL, 'k' },
-        { "ca", required_argument, NULL, 'a' },
-        { "psk-in", required_argument, NULL, 'i' },
-        { "psk-out", required_argument, NULL, 'o' },
-        { NULL, 0, NULL, 0 },
-    };
-    struct options o = { .validate = "off" };
-    bool server;
     SSL_CTX *ctx;
-    char *end;
-    int c, rc;
+    int rc;
 
-    g_opts = &o;
-    while ((c = getopt_long(argc, argv, "", longopts, NULL)) != -1) {
-        switch (c) {
-        case 'r': o.role = optarg; break;
-        case 'h': o.host = optarg; break;
-        case 'p': o.port = optarg; break;
-        case 'g': o.groups = optarg; break;
-        case 's': o.key_share = optarg; break;
-        case 'v': o.validate = optarg; break;
-        case 'c': o.cert = optarg; break;
-        case 'k': o.key = optarg; break;
-        case 'a': o.ca = optarg; break;
-        case 'i': o.psk_in = optarg; break;
-        case 'o': o.psk_out = optarg; break;
-        case 'm':
-            o.mtu = strtol(optarg, &end, 10);
-            if (*end != '\0' || o.mtu <= IP_UDP_OVERHEAD)
-                return usage("--mtu must be an integer above 48 (IPv6 + UDP headers)");
-            o.payload = o.mtu - IP_UDP_OVERHEAD;
-            break;
-        default: return usage("unknown option");
-        }
-    }
-    if (optind != argc || o.role == NULL || o.host == NULL || o.port == NULL || o.groups == NULL)
-        return usage("--role, --host, --port and --groups are required");
-    if (strcmp(o.role, "client") != 0 && strcmp(o.role, "server") != 0)
-        return usage("--role must be client or server");
-    server = strcmp(o.role, "server") == 0;
-    if (strcmp(o.validate, "off") != 0 && strcmp(o.validate, "cookie") != 0)
-        return usage("--validate must be off or cookie");
-    if (server ? o.cert == NULL || o.key == NULL : o.ca == NULL)
-        return usage(server ? "server needs --cert and --key" : "client needs --ca");
-
+    /* Before parsing: usage errors also print a result line. */
+    g_hrr_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    if ((rc = parse_options(argc, argv)) != EXIT_OK)
+        return rc;
     /* Ignore any system openssl.cnf so runs depend only on the pinned build and these flags. */
-    if (!OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, NULL))
+    if (!OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, NULL) || g_hrr_idx < 0)
         return fail_ssl(NULL, 0, "OPENSSL_init_ssl");
-    fprintf(stderr, "%s, role=%s groups=%s key-share=%s mtu=%ld validate=%s\n",
-        OpenSSL_version(OPENSSL_VERSION), o.role, o.groups, o.key_share ? o.key_share : "(default)",
-        o.mtu, o.validate);
+    fprintf(stderr, "%s, role=%s variant=%s groups=%s mtu=%s key-share=%s validate=%s\n",
+        OpenSSL_version(OPENSSL_VERSION), g_opts.val[OPT_ROLE], g_opts.val[OPT_VARIANT],
+        g_opts.val[OPT_GROUPS], g_opts.val[OPT_MTU],
+        g_opts.server ? "-" : g_opts.val[OPT_KEY_SHARE],
+        g_opts.server ? g_opts.val[OPT_VALIDATE] : "-");
 
     /* tls_construct_ctos_key_share() fails with NO_SUITABLE_KEY_SHARE when no share is added. */
-    if (!server && o.key_share != NULL && strcmp(o.key_share, "empty") == 0)
+    if (!g_opts.server && strcmp(g_opts.val[OPT_KEY_SHARE], "empty") == 0)
         return fail_msg(EXIT_UNSUPPORTED, NULL,
             "OpenSSL clients always send at least one key share; empty key_share not possible");
 
-    g_hrr_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
-    ctx = SSL_CTX_new(server ? DTLS_server_method() : DTLS_client_method());
-    if (ctx == NULL || g_hrr_idx < 0 || !SSL_CTX_set_min_proto_version(ctx, DTLS1_3_VERSION)
+    ctx = SSL_CTX_new(g_opts.server ? DTLS_server_method() : DTLS_client_method());
+    if (ctx == NULL || !SSL_CTX_set_min_proto_version(ctx, DTLS1_3_VERSION)
         || !SSL_CTX_set_max_proto_version(ctx, DTLS1_3_VERSION))
         return fail_ssl(NULL, 0, "creating DTLS 1.3 context");
     SSL_CTX_set_msg_callback(ctx, msg_cb);
-    if ((rc = configure_groups(ctx, server)) != EXIT_OK)
+    if ((rc = configure_groups(ctx)) != EXIT_OK)
         return rc;
+    /* Only the client verifies; the server takes --ca because the contract gives it to both. */
+    if (!g_opts.server) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        if (!SSL_CTX_load_verify_locations(ctx, g_opts.val[OPT_CA], NULL))
+            return fail_ssl(NULL, 0, "loading --ca");
+    }
 
-    rc = server ? run_server(ctx) : run_client(ctx);
+    rc = g_opts.server ? run_server(ctx) : run_client(ctx);
     SSL_CTX_free(ctx);
     return rc;
 }
