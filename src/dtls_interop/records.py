@@ -34,7 +34,7 @@ EXT_SUPPORTED_GROUPS = 10
 EXT_COOKIE = 44
 EXT_KEY_SHARE = 51
 
-# SHA-256("HelloRetryRequest"), the ServerHello.random that marks an HRR (RFC 8446 sec 4.1.3).
+# SHA-256("HelloRetryRequest"), the ServerHello.random that marks an HRR (RFC 9846 sec 4.2.3).
 HRR_RANDOM = bytes.fromhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
 
 PLAINTEXT_HEADER_LEN = 13

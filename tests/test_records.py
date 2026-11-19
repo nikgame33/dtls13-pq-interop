@@ -1,4 +1,4 @@
-"""Record parser tests on byte vectors assembled field by field from RFC 9147 / RFC 8446."""
+"""Record parser tests on byte vectors assembled field by field from RFC 9147 / RFC 9846."""
 
 from __future__ import annotations
 
