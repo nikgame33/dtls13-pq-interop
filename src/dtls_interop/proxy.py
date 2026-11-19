@@ -1,23 +1,33 @@
 """Userspace UDP proxy between one client and one server on loopback (ADR 0001).
 
-Enforces a PMTU, applies impairment rules on parsed DTLS records and records every datagram.
+Applies impairment rules on parsed DTLS records, then enforces the PMTU on every datagram it
+sends, and records each datagram in a trace.
 """
 
 from __future__ import annotations
 
+import itertools
 import selectors
 import socket
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from dtls_interop.records import (
+    CONTENT_ACK,
+    CONTENT_HANDSHAKE,
     HS_CLIENT_HELLO,
+    MAX_SEQUENCE_NUMBER,
     HandshakeFragment,
     ParsedDatagram,
+    PlaintextRecord,
+    Record,
+    RecordNumber,
     covered,
+    encode_ack,
+    parse_ack,
     parse_datagram,
 )
 
@@ -31,9 +41,10 @@ _JOIN_TIMEOUT = 5.0
 
 @dataclass(frozen=True)
 class Datagram:
-    """One trace entry, appended when the datagram is sent on or dropped.
+    """One trace entry, appended when the datagram's fate is final.
 
-    ``index`` is the arrival order; ``time`` is when it left the proxy (or was dropped).
+    ``index`` is unique and follows arrival order; ``time`` is when it left or was dropped.
+    A "replaced" datagram was not sent; the datagrams emitted for it carry its index as ``origin``.
     """
 
     index: int
@@ -41,25 +52,28 @@ class Datagram:
     direction: Literal["c2s", "s2c"]
     size: int
     payload: bytes
-    action: Literal["forwarded", "dropped", "delayed"]
+    action: Literal["forwarded", "dropped", "delayed", "replaced"]
     reason: str | None
+    origin: int | None = None  # index of the replaced datagram this one was emitted for
 
 
 @dataclass(frozen=True)
 class Packet:
-    """A received datagram as rules see it."""
+    """A received or rule-emitted datagram as rules see it."""
 
     index: int
     received: float  # seconds since proxy start
     direction: Direction
     payload: bytes
     parsed: ParsedDatagram
+    origin: int | None = None
 
 
 @dataclass(frozen=True)
 class Verdict:
-    action: Literal["forward", "drop", "hold"]
+    action: Literal["forward", "drop", "hold", "replace"]
     reason: str | None = None
+    payloads: tuple[bytes, ...] = ()  # "replace" only
 
 
 FORWARD = Verdict("forward")
@@ -74,10 +88,15 @@ def hold(reason: str) -> Verdict:
     return Verdict("hold", reason)
 
 
+def replace_with(reason: str, payloads: Sequence[bytes]) -> Verdict:
+    """Send ``payloads`` as separate datagrams instead of the packet, through the later rules."""
+    return Verdict("replace", reason, tuple(payloads))
+
+
 class Rule:
     """Base for impairment rules; rules are stateful, so use a fresh instance per proxy.
 
-    Rules run in list order; a packet released by rule i continues at rule i + 1.
+    Rules run in list order; a packet released or emitted by rule i continues at rule i + 1.
     """
 
     def on_packet(self, packet: Packet, now: float) -> Verdict:
@@ -168,6 +187,107 @@ class ReorderClientHelloFragments(Rule):
         return out
 
 
+class SplitClientHello(Rule):
+    """Send each unfragmented CH1 as ``fragments`` near-equal fragments, one record per datagram.
+
+    Tests a server's CH1 reassembly with clients that never fragment CH1 (wolfSSL).
+    List it before rules that should act on the fragments, e.g. ReorderClientHelloFragments.
+    """
+
+    def __init__(self, fragments: int = 2) -> None:
+        if fragments < 2:
+            raise ValueError("fragments must be at least 2")
+        self._k = fragments
+        self._split: set[int] = set()  # client epoch 0 sequence numbers that were split
+
+    def on_packet(self, packet: Packet, now: float) -> Verdict:
+        if packet.parsed.error is not None:
+            return FORWARD
+        if packet.direction == "c2s":
+            return self._client_datagram(packet)
+        return self._server_datagram(packet)
+
+    def _client_datagram(self, packet: Packet) -> Verdict:
+        out: list[bytes] = []
+        cur = b""
+        renumbered = split = False
+        for rec in packet.parsed.records:
+            if not isinstance(rec, PlaintextRecord) or rec.epoch != 0:
+                cur += rec.to_bytes()
+                continue
+            # Client epoch 0 seq n becomes k*n + i: unique and in client order, so the server's
+            # anti-replay window (RFC 9147 sec 4.5.1) sees no duplicate or stale number.
+            base = rec.sequence_number * self._k
+            if base + self._k - 1 > MAX_SEQUENCE_NUMBER:
+                return FORWARD
+            pieces = self._pieces(rec)
+            if pieces is None:
+                renumbered |= base != rec.sequence_number
+                cur += replace(rec, sequence_number=base).to_bytes()
+                continue
+            split = True
+            self._split.add(rec.sequence_number)
+            if cur:
+                out.append(cur)
+                cur = b""
+            for i, frag in enumerate(pieces):
+                out.append(replace(rec, sequence_number=base + i, fragment=frag).to_bytes())
+        if cur:
+            out.append(cur)
+        if split:
+            return replace_with(f"split CH1 into {self._k} fragments", out)
+        if renumbered:
+            return replace_with("renumber client epoch 0 records", out)
+        return FORWARD
+
+    def _pieces(self, rec: PlaintextRecord) -> list[bytes] | None:
+        if rec.content_type != CONTENT_HANDSHAKE or len(rec.handshake) != 1:
+            return None
+        ch = rec.handshake[0]
+        if ch.msg_type != HS_CLIENT_HELLO or ch.message_seq != 0 or not ch.is_whole_message:
+            return None
+        if len(ch.body) != ch.length or ch.length < self._k:
+            return None
+        cuts = [ch.length * i // self._k for i in range(self._k + 1)]
+        return [
+            replace(ch, fragment_offset=a, fragment_length=b - a, body=ch.body[a:b]).to_bytes()
+            for a, b in itertools.pairwise(cuts)
+        ]
+
+    def _server_datagram(self, packet: Packet) -> Verdict:
+        records = [self._map_ack(r) for r in packet.parsed.records]
+        if records == list(packet.parsed.records):
+            return FORWARD
+        return replace_with(
+            "map ACK record numbers back", [b"".join(r.to_bytes() for r in records)]
+        )
+
+    def _map_ack(self, rec: Record) -> Record:
+        # Plaintext ACKs name the renumbered records; map them back so the client's
+        # retransmission logic (RFC 9147 sec 7.2) sees its own record numbers.
+        if not isinstance(rec, PlaintextRecord) or rec.content_type != CONTENT_ACK:
+            return rec
+        numbers = parse_ack(rec.fragment)
+        if numbers is None:
+            return rec
+        mapped = self._client_numbers(numbers)
+        return rec if mapped == numbers else replace(rec, fragment=encode_ack(mapped))
+
+    def _client_numbers(self, numbers: tuple[RecordNumber, ...]) -> tuple[RecordNumber, ...]:
+        seen = {seq for epoch, seq in numbers if epoch == 0}
+        acked = set()
+        for seq in seen:
+            n, i = divmod(seq, self._k)
+            if n in self._split:
+                # The client's record counts as received only once every piece of it is.
+                if all(n * self._k + j in seen for j in range(self._k)):
+                    acked.add(n)
+            elif i == 0:
+                acked.add(n)
+        rest = [(epoch, seq) for epoch, seq in numbers if epoch != 0]
+        return tuple(sorted([(0, n) for n in acked] + rest))
+
+
 @dataclass
 class _Held:
     packet: Packet
@@ -252,15 +372,8 @@ class UdpProxy:
                 raise RuntimeError("UDP proxy thread did not stop")
         self._close_sockets()
         now = self._now()
-        for idx, h in sorted(self._state.held.items()):
-            self._record(
-                idx,
-                now,
-                h.packet.direction,
-                h.packet.payload,
-                "dropped",
-                f"{h.reason}; held at exit",
-            )
+        for _, h in sorted(self._state.held.items()):
+            self._record(h.packet, now, "dropped", f"{h.reason}; held at exit")
         self._state.held.clear()
         if self._error is not None and exc_info[0] is None:
             raise RuntimeError("UDP proxy thread failed") from self._error
@@ -280,17 +393,23 @@ class UdpProxy:
 
     def _record(
         self,
-        index: int,
+        packet: Packet,
         now: float,
-        direction: Direction,
-        payload: bytes,
-        action: Literal["forwarded", "dropped", "delayed"],
+        action: Literal["forwarded", "dropped", "delayed", "replaced"],
         reason: str | None,
     ) -> None:
+        entry = Datagram(
+            packet.index,
+            now,
+            packet.direction,
+            len(packet.payload),
+            packet.payload,
+            action,
+            reason,
+            packet.origin,
+        )
         with self._cond:
-            self._trace.append(
-                Datagram(index, now, direction, len(payload), payload, action, reason)
-            )
+            self._trace.append(entry)
             self._cond.notify_all()
 
     def _run(self) -> None:
@@ -329,37 +448,39 @@ class UdpProxy:
 
     def _receive(self, payload: bytes, addr: tuple[str, int], direction: Direction) -> None:
         state = self._state
-        index = state.next_index
-        state.next_index += 1
-        now = self._now()
+        packet = self._packet(payload, direction, origin=None)
         if direction == "c2s":
             if state.client is None:
                 state.client = addr
             elif addr != state.client:
-                self._record(index, now, direction, payload, "dropped", "unexpected source")
+                self._record(packet, packet.received, "dropped", "unexpected source")
                 return
         elif state.client is None:
-            self._record(index, now, direction, payload, "dropped", "no client yet")
+            self._record(packet, packet.received, "dropped", "no client yet")
             return
-        if self._max_payload is not None and len(payload) > self._max_payload:
-            self._record(index, now, direction, payload, "dropped", "exceeds pmtu")
-            return
-        packet = Packet(
-            index, now, direction, payload, parse_datagram(payload, cid_length=self._cid_length)
-        )
         self._apply(packet, 0, None)
+
+    def _packet(self, payload: bytes, direction: Direction, origin: int | None) -> Packet:
+        index = self._state.next_index
+        self._state.next_index += 1
+        parsed = parse_datagram(payload, cid_length=self._cid_length)
+        return Packet(index, self._now(), direction, payload, parsed, origin)
 
     def _apply(self, packet: Packet, first_rule: int, held_reason: str | None) -> None:
         now = self._now()
         for i in range(first_rule, len(self._rules)):
             verdict = self._rules[i].on_packet(packet, now)
             if verdict.action == "drop":
-                self._record(
-                    packet.index, now, packet.direction, packet.payload, "dropped", verdict.reason
-                )
+                self._record(packet, now, "dropped", verdict.reason)
                 return
             if verdict.action == "hold":
                 self._state.held[packet.index] = _Held(packet, i, verdict.reason)
+                return
+            if verdict.action == "replace":
+                self._record(packet, now, "replaced", verdict.reason)
+                for payload in verdict.payloads:
+                    emitted = self._packet(payload, packet.direction, origin=packet.index)
+                    self._apply(emitted, i + 1, None)
                 return
         self._send(packet, held_reason)
 
@@ -375,6 +496,10 @@ class UdpProxy:
 
     def _send(self, packet: Packet, held_reason: str | None) -> None:
         now = self._now()
+        # Checked after the rules: rules act at the sender, the PMTU is the path behind them.
+        if self._max_payload is not None and len(packet.payload) > self._max_payload:
+            self._record(packet, now, "dropped", "exceeds pmtu")
+            return
         action: Literal["forwarded", "delayed"] = "forwarded"
         reason = None
         if held_reason is not None:
@@ -386,8 +511,6 @@ class UdpProxy:
             elif self._state.client is not None:
                 self._downstream.sendto(packet.payload, self._state.client)
         except OSError as exc:
-            self._record(
-                packet.index, now, packet.direction, packet.payload, "dropped", f"send: {exc}"
-            )
+            self._record(packet, now, "dropped", f"send: {exc}")
             return
-        self._record(packet.index, now, packet.direction, packet.payload, action, reason)
+        self._record(packet, now, action, reason)

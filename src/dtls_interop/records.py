@@ -77,6 +77,17 @@ class HandshakeFragment:
     def is_whole_message(self) -> bool:
         return self.fragment_offset == 0 and self.fragment_length == self.length
 
+    def to_bytes(self) -> bytes:
+        """Wire encoding; exact unless the body was truncated."""
+        return (
+            bytes([self.msg_type])
+            + self.length.to_bytes(3)
+            + self.message_seq.to_bytes(2)
+            + self.fragment_offset.to_bytes(3)
+            + self.fragment_length.to_bytes(3)
+            + self.body
+        )
+
 
 @dataclass(frozen=True)
 class PlaintextRecord:
@@ -87,6 +98,17 @@ class PlaintextRecord:
     fragment: bytes  # shorter than length if the datagram was truncated
     handshake: tuple[HandshakeFragment, ...] = ()
     legacy_version: int = 0xFEFD
+
+    def to_bytes(self) -> bytes:
+        """Wire encoding with the length taken from ``fragment``; ``handshake`` is not consulted."""
+        return (
+            bytes([self.content_type])
+            + self.legacy_version.to_bytes(2)
+            + self.epoch.to_bytes(2)
+            + self.sequence_number.to_bytes(6)
+            + len(self.fragment).to_bytes(2)
+            + self.fragment
+        )
 
 
 @dataclass(frozen=True)
@@ -101,8 +123,40 @@ class CiphertextRecord:
     payload: bytes
     has_length: bool
 
+    def to_bytes(self) -> bytes:
+        seq_len = 2 if self.header & 0x08 else 1
+        length = len(self.payload).to_bytes(2) if self.has_length else b""
+        cid = self.connection_id or b""
+        return (
+            bytes([self.header])
+            + cid
+            + self.sequence_bits.to_bytes(seq_len)
+            + length
+            + (self.payload)
+        )
+
 
 Record = PlaintextRecord | CiphertextRecord
+
+MAX_SEQUENCE_NUMBER = 2**48 - 1  # 48-bit field in DTLSPlaintext
+RecordNumber = tuple[int, int]  # (epoch, sequence_number), RFC 9147 sec 4
+
+
+def parse_ack(fragment: bytes) -> tuple[RecordNumber, ...] | None:
+    """Record numbers in an ACK message (RFC 9147 sec 7), or None if malformed."""
+    if len(fragment) < 2 or int.from_bytes(fragment[:2]) != len(fragment) - 2:
+        return None
+    if (len(fragment) - 2) % 16:
+        return None
+    return tuple(
+        (int.from_bytes(fragment[i : i + 8]), int.from_bytes(fragment[i + 8 : i + 16]))
+        for i in range(2, len(fragment), 16)
+    )
+
+
+def encode_ack(numbers: Iterable[RecordNumber]) -> bytes:
+    body = b"".join(e.to_bytes(8) + s.to_bytes(8) for e, s in numbers)
+    return len(body).to_bytes(2) + body
 
 
 @dataclass(frozen=True)

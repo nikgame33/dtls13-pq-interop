@@ -17,9 +17,17 @@ from dtls_interop.proxy import (
     Packet,
     ReorderClientHelloFragments,
     Rule,
+    SplitClientHello,
     UdpProxy,
     Verdict,
     ch1_fragment_at,
+)
+from dtls_interop.records import (
+    PlaintextRecord,
+    encode_ack,
+    parse_ack,
+    parse_datagram,
+    reassemble,
 )
 
 pytestmark = [
@@ -269,3 +277,151 @@ def test_rule_failure_surfaces_on_exit(server: socket.socket, client: socket.soc
         thread.join(TIMEOUT)  # let the failure happen before exit wakes the thread
         assert not thread.is_alive()
     assert isinstance(info.value.__cause__, ValueError)
+
+
+# --- SplitClientHello ---------------------------------------------------------------------------
+
+PQ_CH1_BODY = bytes(
+    i % 251 for i in range(1400)
+)  # about a ClientHello with an X25519MLKEM768 share
+
+
+def handshake_record(body: bytes, *, record_seq: int, message_seq: int = 0) -> bytes:
+    """One DTLSPlaintext record with one unfragmented ClientHello-type handshake message."""
+    size = len(body).to_bytes(3)
+    hs = b"\x01" + size + message_seq.to_bytes(2) + bytes(3) + size + body
+    return b"\x16\xfe\xfd\x00\x00" + record_seq.to_bytes(6) + len(hs).to_bytes(2) + hs
+
+
+def ack_record(numbers: list[tuple[int, int]], *, record_seq: int = 0) -> bytes:
+    body = encode_ack(numbers)
+    return b"\x1a\xfe\xfd\x00\x00" + record_seq.to_bytes(6) + len(body).to_bytes(2) + body
+
+
+def single_record(payload: bytes) -> PlaintextRecord:
+    parsed = parse_datagram(payload)
+    assert parsed.error is None
+    (record,) = parsed.records
+    assert isinstance(record, PlaintextRecord)
+    return record
+
+
+def test_split_ch1_into_fragments_that_reassemble(
+    server: socket.socket, client: socket.socket
+) -> None:
+    ch1 = handshake_record(PQ_CH1_BODY, record_seq=0)
+    assert len(ch1) > 1280 - IPV6_UDP_OVERHEAD
+    with UdpProxy(server=server_addr(server), pmtu=1280, rules=[SplitClientHello(3)]) as proxy:
+        client.sendto(ch1, proxy.address)
+        received = [server.recv(4096) for _ in range(3)]
+        wait_entries(proxy, 4)
+    records = [single_record(d) for d in received]
+    assert [r.sequence_number for r in records] == [0, 1, 2]
+    frags = [f for r in records for f in r.handshake]
+    assert [(f.message_seq, f.length) for f in frags] == [(0, 1400)] * 3
+    spans = [(f.fragment_offset, f.fragment_length) for f in frags]
+    assert spans == [(0, 466), (466, 467), (933, 467)]
+    assert reassemble(frags) == PQ_CH1_BODY
+    assert [(d.index, d.action, d.origin) for d in proxy.trace] == [
+        (0, "replaced", None),
+        (1, "forwarded", 0),
+        (2, "forwarded", 0),
+        (3, "forwarded", 0),
+    ]
+    assert proxy.trace[0].payload == ch1
+    assert proxy.trace[0].reason == "split CH1 into 3 fragments"
+    assert [d.payload for d in proxy.trace[1:]] == received
+
+
+def test_split_renumbers_client_epoch0_records_monotonically(
+    server: socket.socket, client: socket.socket
+) -> None:
+    ch1 = handshake_record(PQ_CH1_BODY, record_seq=0)
+    retransmission = handshake_record(PQ_CH1_BODY, record_seq=1)
+    ch2 = handshake_record(PQ_CH1_BODY[:300], record_seq=2, message_seq=1)
+    fragmented = ch_fragment(0, 1000, seq=0, record_seq=3)  # already fragmented: not split again
+    with UdpProxy(server=server_addr(server), pmtu=1280, rules=[SplitClientHello()]) as proxy:
+        for datagram in (ch1, retransmission, ch2, fragmented):
+            client.sendto(datagram, proxy.address)
+        received = [server.recv(4096) for _ in range(6)]
+        wait_entries(proxy, 10)
+    # Client seq n becomes 2n + i: unique and increasing, as the server's replay window requires.
+    assert [single_record(d).sequence_number for d in received] == [0, 1, 2, 3, 4, 6]
+    assert single_record(received[4]).fragment == single_record(ch2).fragment
+    assert single_record(received[5]).fragment == single_record(fragmented).fragment
+    replaced = [(d.index, d.reason) for d in proxy.trace if d.action == "replaced"]
+    assert replaced == [
+        (0, "split CH1 into 2 fragments"),
+        (3, "split CH1 into 2 fragments"),
+        (6, "renumber client epoch 0 records"),
+        (8, "renumber client epoch 0 records"),
+    ]
+
+
+def test_split_maps_server_acks_back_to_client_records(
+    server: socket.socket, client: socket.socket
+) -> None:
+    with UdpProxy(server=server_addr(server), rules=[SplitClientHello()]) as proxy:
+        client.sendto(handshake_record(PQ_CH1_BODY, record_seq=0), proxy.address)
+        _, upstream = server.recvfrom(4096)
+        server.recv(4096)
+        cases = [
+            ([(0, 0)], ()),  # one piece of client record 0 is not the whole record
+            ([(0, 0), (0, 1)], ((0, 0),)),
+            ([(0, 1), (2, 7)], ((2, 7),)),
+        ]
+        for server_numbers, client_numbers in cases:
+            server.sendto(ack_record(server_numbers), upstream)
+            assert parse_ack(single_record(client.recv(4096)).fragment) == client_numbers
+        client.sendto(handshake_record(b"x" * 50, record_seq=1, message_seq=1), proxy.address)
+        server.recv(4096)
+        server.sendto(ack_record([(0, 2)]), upstream)  # renumbered client record 1 is 2
+        assert parse_ack(single_record(client.recv(4096)).fragment) == ((0, 1),)
+        alert = b"\x15\xfe\xfd" + bytes(8) + b"\x00\x02\x02\x28"
+        server.sendto(alert, upstream)
+        assert client.recv(4096) == alert
+        wait_entries(proxy, 14)
+    s2c = [d for d in proxy.trace if d.direction == "s2c"]
+    assert [d.action for d in s2c] == ["replaced", "forwarded"] * 4 + ["forwarded"]
+    assert {d.reason for d in s2c if d.action == "replaced"} == {"map ACK record numbers back"}
+
+
+def test_pmtu_applies_to_split_fragments_not_the_original(
+    server: socket.socket, client: socket.socket
+) -> None:
+    ch1 = handshake_record(PQ_CH1_BODY, record_seq=0)
+    huge = handshake_record(bytes(3000), record_seq=1)
+    with UdpProxy(server=server_addr(server), pmtu=1280, rules=[SplitClientHello()]) as proxy:
+        client.sendto(ch1, proxy.address)
+        client.sendto(huge, proxy.address)
+        client.sendto(b"marker", proxy.address)
+        assert len(server.recv(4096)) <= proxy.max_payload
+        assert len(server.recv(4096)) <= proxy.max_payload
+        assert server.recv(4096) == b"marker"  # both 1.5 KB halves of the huge CH1 were dropped
+        wait_entries(proxy, 7)
+    assert [(d.index, d.action, d.reason, d.origin) for d in proxy.trace[3:6]] == [
+        (3, "replaced", "split CH1 into 2 fragments", None),
+        (4, "dropped", "exceeds pmtu", 3),
+        (5, "dropped", "exceeds pmtu", 3),
+    ]
+
+
+def test_split_fragments_pass_through_later_rules(
+    server: socket.socket, client: socket.socket
+) -> None:
+    rules = [SplitClientHello(), ReorderClientHelloFragments()]
+    with UdpProxy(server=server_addr(server), pmtu=1280, rules=rules) as proxy:
+        client.sendto(handshake_record(PQ_CH1_BODY, record_seq=0), proxy.address)
+        offsets = [single_record(server.recv(4096)).handshake[0].fragment_offset for _ in range(2)]
+        wait_entries(proxy, 3)
+    assert offsets == [700, 0]
+    assert [(d.index, d.action, d.origin) for d in proxy.trace] == [
+        (0, "replaced", None),
+        (2, "delayed", 0),
+        (1, "delayed", 0),
+    ]
+
+
+def test_split_rejects_fewer_than_two_fragments() -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        SplitClientHello(1)

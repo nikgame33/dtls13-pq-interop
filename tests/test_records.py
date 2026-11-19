@@ -13,6 +13,8 @@ from dtls_interop.records import (
     KeyShareEntry,
     PlaintextRecord,
     covered,
+    encode_ack,
+    parse_ack,
     parse_datagram,
     parse_hello,
     reassemble,
@@ -285,3 +287,28 @@ def test_mutated_input_hits_no_parser_bug() -> None:
             data[rng.randrange(len(data))] = rng.randrange(256)
         parsed = parse_datagram(bytes(data[: rng.randint(0, len(data))]))
         assert parsed.error is None or not parsed.error.startswith("parser error"), parsed.error
+
+
+def test_records_reencode_to_the_same_bytes() -> None:
+    hrr = hello_retry_request(ext(51, u16(X25519MLKEM768)))
+    data = (
+        plaintext(22, hs_fragment(2, hrr) + hs_fragment(1, PQ_CH, offset=3, size=40), seq=5)
+        + bytes([0b0011_1101]) + b"\xc1\xd2" + u16(0x0102) + u16(3) + b"xyz"
+        + bytes([0b0010_0010]) + u8(9) + b"\x02" * 40
+    )  # fmt: skip
+    parsed = parse_datagram(data, cid_length=2)
+    assert parsed.error is None
+    assert b"".join(r.to_bytes() for r in parsed.records) == data
+    handshake = parsed.records[0]
+    assert isinstance(handshake, PlaintextRecord)
+    assert b"".join(f.to_bytes() for f in handshake.handshake) == handshake.fragment
+
+
+def test_ack_round_trip() -> None:
+    numbers = ((0, 1), (0, 2), (2, 0x0102030405))
+    body = encode_ack(numbers)
+    assert body == u16(48) + b"".join(e.to_bytes(8) + s.to_bytes(8) for e, s in numbers)
+    assert parse_ack(body) == numbers
+    assert parse_ack(encode_ack([])) == ()
+    assert parse_ack(body[:-1]) is None
+    assert parse_ack(u16(15) + bytes(15)) is None
