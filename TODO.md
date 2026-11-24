@@ -61,5 +61,5 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 ## Open questions
 
 - [ ] Ask John Mattsson for the CipherSnake configurations behind his findings, so we test the same settings
-- [ ] Include GnuTLS? (check DTLS 1.3 status)
+- [x] Include GnuTLS? (check DTLS 1.3 status) - no, not in 3.8.14 or master, see [library survey](docs/research/library-survey.md#gnutls)
 - [ ] Which BoringSSL commit and NSS release to pin (latest at time of Phase 2)
