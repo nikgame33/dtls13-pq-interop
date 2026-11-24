@@ -41,8 +41,8 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 - [ ] S04 stateless cookie with fragmented CH1, including server state and amplification measurement
 - [ ] S05, S06 HRR paths (empty share, wrong guess)
 - [ ] S07 MLKEM512X25519 at PMTU 1280: measure whether CH1 and CH2 really stay unfragmented with realistic extensions (SNI, ALPN, use_srtp for WebRTC-like profile)
-- [ ] S08, S09 reordering and loss
-- [ ] Run S03, S04, S08, S09 with wolfSSL clients through `SplitClientHello`, since they never fragment CH1
+- [x] S08, S09 reordering and loss (PR #11)
+- [x] Run S03, S04, S08, S09 with wolfSSL clients through `SplitClientHello`, since they never fragment CH1 (PR #11, `<ID>+split` rows, ADR 0003)
 - [ ] S10 PSK resumption after HRR
 - [ ] T01 TLS 1.3 HRR cookie echo
 
