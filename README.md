@@ -29,7 +29,7 @@ No root, containers or network namespaces are needed ([ADR 0001](docs/adr/0001-n
 
 ## Status
 
-Early setup.
+Harness core (proxy, record parser, runner, results) and the OpenSSL 4.1.0 and wolfSSL 5.9.4 adapters work.
 Work items are tracked in [TODO.md](TODO.md).
 
 ## Development
