@@ -38,7 +38,9 @@ if [[ ! -f "$STAMP" || "$(cat "$STAMP")" != "$STAMP_CONTENT" ]]; then
     tar -xzf "$ARCHIVE" -C "$PREFIX/src"
     grep -q "^#define NSS_VERSION \"$VERSION\" " "$SRC/nss/lib/nss/nss.h"
     grep -q "^#define PR_VERSION \"$NSPR_VERSION\"$" "$SRC/nspr/pr/include/prinit.h"
-    if ! make -C "$SRC/nss" -j"$(nproc)" nss_build_all "${MAKE_FLAGS[@]}" >"$PREFIX/make.log" 2>&1; then
+    # Serial: with -j the $(shell $(MAKE) get_objs) calls in coreconf/rules.mk failed on CI
+    # ("multiple target patterns"); a serial build takes about 200 s.
+    if ! make -C "$SRC/nss" nss_build_all "${MAKE_FLAGS[@]}" >"$PREFIX/make.log" 2>&1; then
         tail -n 60 "$PREFIX/make.log" >&2
         exit 1
     fi
