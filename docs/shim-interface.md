@@ -20,6 +20,7 @@ Adapter tests for an implementation live in `tests/impl/test_<name>.py` and obta
 Locally they skip when the implementation is not built.
 CI runs them per implementation with `DTLS_INTEROP_REQUIRE=<name>`, which turns a missing build into a failure.
 The conformance suite in `tests/conformance/` checks every rule in this document against every built implementation and variant.
+It discovers implementations and variants itself, so a new adapter needs no change to the suite; CI runs it in each implementation's job.
 
 ## Run
 
@@ -38,6 +39,7 @@ run --role=client|server
 Every option listed for a role is required; there are no implicit defaults.
 The value `default` means "do not configure this, let the library decide", so library defaults are measured explicitly.
 A missing, unknown, repeated or other-role option, or a malformed value, is a usage error (exit 64).
+Option names match exactly, so an abbreviation such as `--group` is an unknown option, and an empty value is malformed.
 A `--key-share` group that is not in `--groups` counts as malformed.
 The runner passes every option as `--opt=value`; adapters must accept that form and should also accept `--opt value`.
 
