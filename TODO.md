@@ -31,7 +31,7 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 - [ ] OpenSSL 4.1.0: decide between `openssl s_client`/`s_server` and a small C adapter on the listener API (`SSL_new_listener`, validation on by default)
 - [ ] wolfSSL v5.9.4-stable: configure flags for DTLS 1.3 + ML-KEM hybrids; find the option that allows fragmented CH1
 - [ ] BoringSSL: pin a commit; small C/C++ adapter (bssl tool has no DTLS)
-- [ ] NSS: pin a release; check `tstclnt`/`selfserv` DTLS 1.3 + group options, otherwise a small adapter
+- [x] NSS: pin a release; check `tstclnt`/`selfserv` DTLS 1.3 + group options, otherwise a small adapter (PR #12)
 - [ ] mbedTLS 4.3.0: TLS 1.3 only, for T01 (HRR cookie echo); confirm DTLS 1.3 is really absent upstream
 - [ ] Document per implementation which matrix options map to which flags or API calls, and which are unsupported
 
