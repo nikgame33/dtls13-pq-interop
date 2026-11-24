@@ -29,7 +29,7 @@ def _events(p: Pair) -> dict[str, list[Event]]:
 
 
 def _ok(p: Pair) -> None:
-    check_pair_ok(p, X25519, hrr=False, cookie=False, hrr_group=False)
+    check_pair_ok(p, X25519, hrr=False, hrr_group=False)
 
 
 def test_close_notify_order(pair: PairCase, harness: Harness) -> None:

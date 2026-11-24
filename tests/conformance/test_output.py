@@ -13,11 +13,11 @@ from .harness import (
     EXIT_FAIL,
     EXIT_OK,
     EXIT_UNSUPPORTED,
-    READY_TIMEOUT,
     X25519,
     Harness,
     PairCase,
     Subject,
+    await_ready,
     check_pair_ok,
     check_protocol,
     free_port,
@@ -35,8 +35,8 @@ def _ready(harness: Harness, subject: Subject, port: str) -> tuple[str | None, b
     """First stdout line of a server on --port=port, and whether that port is bound by then."""
     opts = harness.options(subject.impl, SERVER, port=port)
     adapter = harness.start(subject.impl, SERVER, render(opts, "equals"))
-    line = adapter.first_line(READY_TIMEOUT)
-    bound = (p := ready_port(line)) is not None and port_is_bound(p)
+    bound = port_is_bound(await_ready(adapter))
+    line = adapter.first_line(0)
     run = adapter.finish()
     assert run.code is None, f"the server must wait for a client after ready\n{run.describe()}"
     return line, bound
@@ -59,17 +59,17 @@ def test_ready_line_reports_requested_port(server_subject: Subject, harness: Har
 
 def test_successful_handshake_result_lines(pair: PairCase, harness: Harness) -> None:
     """S01 baseline: all fields set, error null, consistent with the wire."""
-    check_pair_ok(harness.pair(pair), X25519, hrr=False, cookie=False, hrr_group=False)
+    check_pair_ok(harness.pair(pair), X25519, hrr=False, hrr_group=False)
 
 
 def test_space_separated_options(pair: PairCase, harness: Harness) -> None:
     p = harness.pair(pair, form="space")
-    check_pair_ok(p, X25519, hrr=False, cookie=False, hrr_group=False)
+    check_pair_ok(p, X25519, hrr=False, hrr_group=False)
 
 
 def test_default_mtu_is_accepted(pair: PairCase, harness: Harness) -> None:
     p = harness.pair(pair, client={"mtu": "default"}, server={"mtu": "default"})
-    check_pair_ok(p, X25519, hrr=False, cookie=False, hrr_group=False)
+    check_pair_ok(p, X25519, hrr=False, hrr_group=False)
 
 
 def test_untrusted_server_fails(client_subject: Subject, harness: Harness, tmp_path) -> None:

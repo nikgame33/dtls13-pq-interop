@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from dtls_interop.implementations import CLIENT, DEFAULT_VARIANT, SERVER, Implementation
 from dtls_interop.pki import TestPki
 from dtls_interop.proxy import FORWARD, Datagram, Packet, Rule, UdpProxy, Verdict, drop
@@ -162,6 +164,11 @@ class Adapter:
             self._eof = True
             self._cond.notify_all()
 
+    @property
+    def stdout_closed(self) -> bool:
+        with self._cond:
+            return self._eof
+
     def first_line(self, timeout: float) -> str | None:
         with self._cond:
             self._cond.wait_for(lambda: self._lines or self._eof, timeout)
@@ -274,13 +281,13 @@ class Harness:
         server: dict[str, str | None] | None = None,
         rules: Sequence[Rule] = (),
         form: str = "equals",
+        client_may_be_unsupported: bool = False,
     ) -> Pair:
-        """Server, then a proxy without PMTU limit (sizes are checked on the trace), then client."""
+        """Server, then a proxy without PMTU limit (sizes are checked on the trace), then client.
+        Skips when a side exits 2, unless the caller checks an unsupported client itself."""
         sopts = self.options(case.server, SERVER, **(server or {}))
         srv = self.start(case.server, SERVER, render(sopts, form))
-        port = ready_port(srv.first_line(READY_TIMEOUT))
-        if port is None:
-            return Pair(None, srv.finish(SERVER_GRACE), [], 0.0)
+        port = await_ready(srv)
         with UdpProxy((HOST, port), pmtu=None, rules=rules) as proxy:
             t0 = time.monotonic()
             copts = self.options(case.client, CLIENT, port=str(proxy.address[1]), **(client or {}))
@@ -288,12 +295,35 @@ class Harness:
             if cli.wait(RUN_TIMEOUT):
                 srv.wait(SERVER_GRACE)
             client_run, server_run = cli.finish(), srv.finish()
+        for run in (server_run, client_run):
+            if unsupported(run) and not (run is client_run and client_may_be_unsupported):
+                check_protocol(run)
+                pytest.skip(f"{run.role} reports unsupported: {run.result['error']}")
         return Pair(client_run, server_run, proxy.trace, t0)
 
     def close(self) -> None:
         for adapter in self._adapters:
             if adapter.proc.returncode is None:
                 adapter.finish()
+
+
+def await_ready(server: Adapter) -> int:
+    """The port from the server's ready line; an exit 2 before it skips, anything else fails."""
+    line = server.first_line(READY_TIMEOUT)
+    port = ready_port(line)
+    if port is not None:
+        return port
+    run = server.finish(SERVER_GRACE if line is not None or server.stdout_closed else 0.0)
+    if run.code == EXIT_UNSUPPORTED:
+        check_protocol(run)
+        pytest.skip(f"server reports unsupported: {run.result['error']}")
+    if run.code is None:
+        reason = f"no ready line within {READY_TIMEOUT} s (first line {line!r})"
+    elif run.code == EXIT_USAGE:
+        reason = "the server rejected its options (exit 64) instead of printing ready"
+    else:
+        reason = f"the server exited {run.code} before printing ready"
+    pytest.fail(f"{reason}\n{run.describe()}", pytrace=False)
 
 
 def ready_port(line: str | None) -> int | None:
@@ -357,16 +387,34 @@ def check_ok(run: Run | None, group: str, *, hrr: bool, cookie: bool, hrr_group:
     assert result == expected, run.describe() if run else ""
 
 
-def check_pair_ok(pair: Pair, group: str, *, hrr: bool, cookie: bool, hrr_group: bool) -> None:
-    """Both sides succeed with the expected result, and the wire shows the same handshake."""
+def check_pair_ok(
+    pair: Pair, group: str, *, hrr: bool, hrr_group: bool, cookie: bool | None = None
+) -> None:
+    """Both sides succeed with the expected result, and the wire shows the same handshake.
+    cookie=None (--validate=off): an HRR needed for the group may carry a library-forced cookie."""
+    cookie = check_hrr_on_wire(pair, cookie)
     for run in (pair.client, pair.server):
         check_ok(run, group, hrr=hrr, cookie=cookie, hrr_group=hrr_group)
     wire = pair.wire
     assert wire.group == GROUP_CODES[group], wire
     assert (wire.hrr is not None) is hrr, wire
-    if wire.hrr is not None:
-        assert wire.hrr.cookie is cookie, wire
-        assert (wire.hrr.selected_group is not None) is hrr_group, wire
+
+
+def check_hrr_on_wire(pair: Pair, cookie: bool | None = None) -> bool:
+    """Both result lines report the HRR the trace shows; returns whether it had a cookie.
+    cookie=None (--validate=off): no HRR that only carries a cookie."""
+    hrr = pair.wire.hrr
+    wire_cookie = hrr is not None and hrr.cookie
+    if cookie is None:
+        assert not (wire_cookie and hrr.selected_group is None), f"cookie-only HRR: {pair.wire}"
+    else:
+        assert wire_cookie is cookie, pair.wire
+    seen = {"hrr": hrr is not None, "hrr_cookie": wire_cookie}
+    seen["hrr_group"] = hrr is not None and hrr.selected_group is not None
+    for run in (pair.client, pair.server):
+        result = check_protocol(run)
+        assert {k: result[k] for k in seen} == seen, f"{pair.wire}\n{run and run.describe()}"
+    return wire_cookie
 
 
 def unsupported(run: Run | None) -> bool:

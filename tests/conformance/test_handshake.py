@@ -12,21 +12,14 @@ from .harness import (
     P256,
     X25519,
     Harness,
-    Pair,
     PairCase,
     Subject,
+    check_hrr_on_wire,
     check_pair_ok,
     check_protocol,
     datagram_sizes,
     unsupported,
 )
-
-
-def _skip_unsupported(p: Pair) -> None:
-    for run in (p.client, p.server):
-        if unsupported(run):
-            check_protocol(run)
-            pytest.skip(f"{run.role} reports unsupported: {run.result['error']}")
 
 
 def _codes(*groups: str) -> tuple[int, ...]:
@@ -57,8 +50,7 @@ def test_server_group_selection(server_subject: Subject, harness: Harness, case)
         client={"groups": ",".join(client_groups), "key_share": share},
         server={"groups": ",".join(server_groups)},
     )
-    _skip_unsupported(p)
-    check_pair_ok(p, group, hrr=hrr, cookie=False, hrr_group=hrr)
+    check_pair_ok(p, group, hrr=hrr, hrr_group=hrr)
     assert p.wire.client_hellos[0].key_shares[0].group == GROUP_CODES[share]
     if hrr:
         assert p.wire.hrr is not None and p.wire.hrr.selected_group == GROUP_CODES[group]
@@ -71,7 +63,6 @@ def test_no_mutual_group_fails(server_subject: Subject, harness: Harness) -> Non
         client={"groups": X25519, "key_share": X25519},
         server={"groups": MLKEM},
     )
-    _skip_unsupported(p)
     for run in (p.client, p.server):
         assert run is not None and run.code == EXIT_FAIL, run and run.describe()
         check_protocol(run)
@@ -95,12 +86,13 @@ def test_client_sends_exactly_the_requested_share(
         PairCase(client_subject.impl, client_subject.peer),
         client={"groups": ",".join(groups), "key_share": share, "mtu": mtu},
         server={"groups": ",".join(groups), "mtu": mtu},
+        client_may_be_unsupported=True,
     )
     if unsupported(p.client):
         check_protocol(p.client)
         assert p.trace == [], "a client that cannot send the share must not send another CH1"
         pytest.skip(f"client reports unsupported: {p.client.result['error']}")
-    check_pair_ok(p, share, hrr=False, cookie=False, hrr_group=False)
+    check_pair_ok(p, share, hrr=False, hrr_group=False)
     assert [s.group for s in p.wire.client_hellos[0].key_shares] == [GROUP_CODES[share]]
 
 
@@ -110,12 +102,13 @@ def test_client_empty_key_share(client_subject: Subject, harness: Harness) -> No
         PairCase(client_subject.impl, client_subject.peer),
         client={"groups": f"{X25519},{MLKEM}", "key_share": "empty"},
         server={"groups": f"{MLKEM},{X25519}"},
+        client_may_be_unsupported=True,
     )
     if unsupported(p.client):
         check_protocol(p.client)
         assert p.trace == [], "a client that cannot send an empty key_share must not send CH1"
         pytest.skip(f"client reports unsupported: {p.client.result['error']}")
-    check_pair_ok(p, MLKEM, hrr=True, cookie=False, hrr_group=True)
+    check_pair_ok(p, MLKEM, hrr=True, hrr_group=True)
     assert p.wire.client_hellos[0].key_shares == ()
 
 
@@ -126,8 +119,8 @@ def test_client_default_key_share(client_subject: Subject, harness: Harness) -> 
         server={"groups": f"{X25519},{MLKEM}"},
     )
     for run in (p.client, p.server):
-        check_protocol(run)
-        assert run is not None and run.result["ok"], run and run.describe()
+        assert check_protocol(run)["ok"], run and run.describe()
+    check_hrr_on_wire(p)
     shares = {s.group for s in p.wire.client_hellos[0].key_shares}
     assert shares <= set(_codes(X25519, MLKEM)), p.wire
 
@@ -139,8 +132,7 @@ def test_client_supported_groups_in_order(client_subject: Subject, harness: Harn
         client={"groups": ",".join(groups), "key_share": X25519},
         server={"groups": X25519},
     )
-    _skip_unsupported(p)
-    check_pair_ok(p, X25519, hrr=False, cookie=False, hrr_group=False)
+    check_pair_ok(p, X25519, hrr=False, hrr_group=False)
     assert p.wire.client_hellos[0].supported_groups == _codes(*groups), p.wire
 
 
@@ -151,7 +143,7 @@ def test_server_address_validation(server_subject: Subject, harness: Harness, va
         PairCase(server_subject.peer, server_subject.impl), server={"validate": validate}
     )
     cookie = validate == "cookie"
-    check_pair_ok(p, X25519, hrr=cookie, cookie=cookie, hrr_group=False)
+    check_pair_ok(p, X25519, hrr=cookie, hrr_group=False, cookie=True if cookie else None)
     if cookie:
         assert len(p.wire.client_hellos) == 2 and p.wire.client_hellos[1].cookie, p.wire
 
@@ -164,10 +156,9 @@ def test_mtu_bounds_udp_payload(pair: PairCase, harness: Harness, mtu: int, vali
     p = harness.pair(
         pair, client=opts | {"key_share": "default"}, server=opts | {"validate": validate}
     )
-    _skip_unsupported(p)
     for run in (p.client, p.server):
-        check_protocol(run)
-        assert run is not None and run.result["ok"], run and run.describe()
+        assert check_protocol(run)["ok"], run and run.describe()
+    check_hrr_on_wire(p, True if validate == "cookie" else None)
     limit = mtu - IP_UDP_OVERHEAD
     for direction in ("c2s", "s2c"):
         sizes = datagram_sizes(p.trace, direction)

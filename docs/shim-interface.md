@@ -63,6 +63,11 @@ A server selects the group as follows:
 
 An acceptable key share never triggers an HRR just to get a group the server ranks higher.
 
+### Address validation
+
+`--validate=cookie` makes the server send an HRR with a cookie to a new peer before it continues the handshake.
+With `--validate=off` the server never sends an HRR whose only purpose is a cookie; an HRR needed for group selection may still carry a cookie the library always adds (e.g. for a stateless HRR), and `hrr_cookie` reports it.
+
 ### Key share
 
 `--key-share=GROUP` sends exactly one key share for GROUP, which must be in `--groups`.
