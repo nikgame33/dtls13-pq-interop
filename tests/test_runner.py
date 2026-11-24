@@ -77,6 +77,7 @@ def test_pass_records_everything(tmp_path, layout, test_pki):
             "hrr": None,
             "hrr_cookie": None,
             "hrr_group": None,
+            "resumed": False,
             "error": None,
         }
         assert side.variant == "default"
@@ -84,6 +85,8 @@ def test_pass_records_everything(tmp_path, layout, test_pki):
     assert result.server.command[1:] == [
         "--role=server",
         "--variant=default",
+        "--transport=dtls",
+        "--resume=off",
         "--host=127.0.0.1",
         "--port=0",
         "--groups=X25519",
@@ -100,6 +103,8 @@ def test_pass_records_everything(tmp_path, layout, test_pki):
     assert result.client.command[1:] == [
         "--role=client",
         "--variant=default",
+        "--transport=dtls",
+        "--resume=off",
         "--host=127.0.0.1",
         client_port,
         "--groups=X25519",
@@ -120,6 +125,7 @@ def test_pass_records_everything(tmp_path, layout, test_pki):
     ]
     # Plain UDP carries no ClientHello.
     assert result.ch1_size is None and result.ch2_fragments is None
+    assert result.cookie_echoed is None
 
     d = case_dir(layout)
     assert d.parent.parent.parent.name == layout.started.strftime("%Y-%m-%d")
@@ -317,25 +323,149 @@ def test_adapter_not_executable(tmp_path, layout, test_pki):
 
 
 @pytest.mark.parametrize(
-    ("scenario_id", "reason", "path_factory"),
+    ("scenario_id", "reason"),
     [
-        ("S08", "path impairments not available", None),
-        ("S09", "path impairments not available", None),
-        ("S03+split", "CH1 split needs the proxy", None),
-        ("S10", "PSK resumption is not implemented in the runner", runner.proxy_path),
-        ("T01", "tls transport is not in the adapter contract", runner.proxy_path),
+        ("S08", "path impairments not available"),
+        ("S09", "path impairments not available"),
+        ("S03+split", "CH1 split needs the proxy"),
     ],
 )
-def test_unrunnable_scenarios_are_errors(
-    tmp_path, layout, test_pki, scenario_id, reason, path_factory
-):
+def test_unrunnable_scenarios_are_errors(tmp_path, layout, test_pki, scenario_id, reason):
     scenario = scenarios.get(scenario_id)
-    result = run(tmp_path, layout, test_pki, scenario=scenario, path_factory=path_factory)
+    result = run(tmp_path, layout, test_pki, scenario=scenario, path_factory=None)
 
     assert result.outcome is Outcome.ERROR
     assert result.reason == reason
     assert not result.client.started and not result.server.started
     assert read_result(case_dir(layout, scenario) / RESULT_FILE) == result
+
+
+def test_resumption_runs_two_connections(tmp_path, layout, test_pki):
+    s10 = scenarios.get("S10")
+    result = run(tmp_path, layout, test_pki, scenario=s10)
+
+    assert result.outcome is Outcome.PASS, result.reason
+    assert "--resume=ticket" in result.client.command
+    assert "--resume=ticket" in result.server.command
+    # The echo server answers one ping per connection, so a pass means both connections ran.
+    assert result.client.result["resumed"] is True
+    assert result.server.result["resumed"] is True
+
+
+def test_resumption_not_reported_is_fail(tmp_path, layout, test_pki):
+    s10 = scenarios.get("S10")
+    result = run(tmp_path, layout, test_pki, scenario=s10, server_flags=["--report=resumed=false"])
+
+    assert result.outcome is Outcome.FAIL
+    assert result.reason == "server reported resumed=False, expected True"
+
+
+def test_resumption_failure_names_the_connection(tmp_path, layout, test_pki):
+    s10 = scenarios.get("S10")
+    result = run(tmp_path, layout, test_pki, scenario=s10, client_flags=["--behave=fail"])
+
+    assert result.outcome is Outcome.FAIL
+    assert result.reason == "client: connection 2: simulated handshake failure"
+
+
+def tls_trace(layout: RunLayout, scenario) -> list[dict]:
+    text = (case_dir(layout, scenario) / "trace.jsonl").read_text()
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def test_tls_runs_over_tcp_through_the_tcp_proxy(tmp_path, layout, test_pki):
+    t01 = scenarios.get("T01")
+    result = run(tmp_path, layout, test_pki, scenario=t01)
+
+    assert result.outcome is Outcome.PASS, result.reason
+    for side in (result.client, result.server):
+        assert "--transport=tls" in side.command and "--mtu=default" in side.command
+    assert result.path.proxied is True
+    assert result.trace == "trace.jsonl"
+    # No TLS hellos in a plain ping/pong stream: nothing to say about the cookie.
+    assert result.cookie_echoed is None
+    trace = tls_trace(layout, t01)
+    c2s = b"".join(bytes.fromhex(s["payload"]) for s in trace if s["direction"] == "c2s")
+    s2c = b"".join(bytes.fromhex(s["payload"]) for s in trace if s["direction"] == "s2c")
+    assert (c2s, s2c) == (b"ping", b"pong")
+    assert {s["flow"] for s in trace} == {0}
+
+
+@pytest.mark.parametrize(
+    ("hello", "outcome", "echoed"),
+    [("echo", Outcome.PASS, True), ("drop", Outcome.FAIL, False), ("alter", Outcome.FAIL, False)],
+)
+def test_tls_cookie_echo_is_read_from_the_trace(tmp_path, layout, test_pki, hello, outcome, echoed):
+    t01 = scenarios.get("T01")
+    flags = [f"--tls-hello={hello}"]
+    result = run(tmp_path, layout, test_pki, scenario=t01, client_flags=flags, server_flags=flags)
+
+    assert result.outcome is outcome, result.reason
+    assert result.cookie_echoed is echoed
+    if outcome is Outcome.FAIL:
+        assert result.reason == "trace: the client did not echo the HRR cookie in CH2"
+    assert read_result(case_dir(layout, t01) / RESULT_FILE) == result
+
+
+def test_tls_resumption_uses_a_flow_per_connection(tmp_path, layout, test_pki):
+    t01 = scenarios.get("T01")
+    scenario = dataclasses.replace(
+        t01, resumption=True, expected=dataclasses.replace(t01.expected, resumed=True)
+    )
+    flags = ["--tls-hello=echo"]
+    result = run(
+        tmp_path, layout, test_pki, scenario=scenario, client_flags=flags, server_flags=flags
+    )
+
+    assert result.outcome is Outcome.PASS, result.reason
+    assert result.cookie_echoed is True
+    assert {s["flow"] for s in tls_trace(layout, scenario)} == {0, 1}
+
+
+@pytest.mark.parametrize("role", ["client", "server"])
+def test_undeclared_transport_is_unsupported_without_starting(tmp_path, layout, test_pki, role):
+    both = "dtls\ntls\n"
+    client = install(tmp_path, "echo-client", transports="dtls\n" if role == "client" else both)
+    server = install(tmp_path, "echo-server", transports=None if role == "server" else both)
+    t01 = scenarios.get("T01")
+
+    result = runner.run_case(t01, client, server, layout=layout, pki=test_pki, **OK_LIMITS)
+
+    assert result.outcome is Outcome.UNSUPPORTED
+    name = f"echo-{role}"
+    assert result.reason == f"{role}: {name} does not declare the tls transport (declares dtls)"
+    assert not result.client.started and not result.server.started
+
+
+def test_tls_only_implementation_skips_dtls(tmp_path, layout, test_pki):
+    client = install(tmp_path, "echo-client", "--implements=tls", transports="tls\n")
+    server = install(tmp_path, "echo-server")
+
+    dtls = runner.run_case(S01, client, server, layout=layout, pki=test_pki, **OK_LIMITS)
+    tls = runner.run_case(
+        scenarios.get("T01"), client, server, layout=layout, pki=test_pki, **OK_LIMITS
+    )
+
+    assert dtls.outcome is Outcome.UNSUPPORTED and not dtls.server.started
+    assert tls.outcome is Outcome.PASS, tls.reason
+
+
+def test_adapter_refusing_a_declared_transport_is_unsupported(tmp_path, layout, test_pki):
+    t01 = scenarios.get("T01")
+    result = run(tmp_path, layout, test_pki, scenario=t01, server_flags=["--implements=dtls"])
+
+    assert result.outcome is Outcome.UNSUPPORTED
+    assert result.reason == "server: tls transport not implemented"
+
+
+def test_numeric_mtu_with_tls_is_usage_error(tmp_path, layout, test_pki):
+    t01 = scenarios.get("T01")
+    client_options = dataclasses.replace(t01.client, mtu=1500)
+    scenario = dataclasses.replace(t01, client=client_options)
+    result = run(tmp_path, layout, test_pki, scenario=scenario, server_grace=0.5)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason.endswith("usage error: --mtu must be default with --transport=tls")
 
 
 @dataclasses.dataclass
@@ -500,6 +630,7 @@ def test_ready_line_without_port_is_error(tmp_path, layout, test_pki):
             "server: result 'hrr_group' must be false when 'hrr' is false",
         ),
         (["--report=hrr_group=1"], "server: result 'hrr_group' has wrong type: 1"),
+        (['--report=resumed="yes"'], "server: result 'resumed' has wrong type: 'yes'"),
     ],
 )
 def test_hrr_reason_fields_are_validated(tmp_path, layout, test_pki, report, reason):

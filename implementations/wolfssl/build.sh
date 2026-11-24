@@ -12,6 +12,7 @@ CONFIGURE_FLAGS=(
     --enable-dtls13
     --enable-dtls-mtu
     --enable-curve25519
+    --enable-session-ticket
     --enable-static
     --disable-shared
     --disable-examples

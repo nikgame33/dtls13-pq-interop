@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 # Bump on any incompatible change to CaseResult; readers reject other versions.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RESULT_FILE = "result.json"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
@@ -85,6 +85,8 @@ class CaseResult:
     ch1_fragments: int | None = None
     ch2_size: int | None = None
     ch2_fragments: int | None = None
+    # From the trace: CH2 echoed the HRR cookie unchanged; None without a trace showing both.
+    cookie_echoed: bool | None = None
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self), indent=2) + "\n"

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Test-only adapter: the shim contract over plain UDP (no DTLS), with injectable misbehaviour."""
+"""Test-only adapter: the shim contract over plain UDP or TCP (no DTLS/TLS), with injectable
+misbehaviour. With --transport=tls it relays over TCP; --tls-hello sends a synthetic
+CH1/HRR/CH2 in TLS records first, so the runner's trace analysis sees real TCP flows."""
 
 import argparse
 import json
@@ -28,7 +30,7 @@ ROLE_OPTIONS = {
     "client": {"key_share"},
     "server": {"validate", "cert", "key"},
 }
-COMMON_OPTIONS = {"variant", "host", "port", "groups", "mtu", "ca"}
+COMMON_OPTIONS = {"variant", "transport", "resume", "host", "port", "groups", "mtu", "ca"}
 RECV_TIMEOUT = 30.0
 
 
@@ -83,6 +85,8 @@ def report(value):
 def parse_args(parser):
     parser.add_argument("--role", action=Once, choices=("client", "server"))
     parser.add_argument("--variant", action=Once, type=name)
+    parser.add_argument("--transport", action=Once, choices=("dtls", "tls"))
+    parser.add_argument("--resume", action=Once, choices=("off", "ticket"))
     parser.add_argument("--host", action=Once)
     parser.add_argument("--port", action=Once, type=int)
     parser.add_argument("--groups", action=Once)
@@ -97,6 +101,8 @@ def parse_args(parser):
     parser.add_argument("--behave", choices=BEHAVIOURS, default="normal")
     parser.add_argument("--spawn-child", action="store_true", help="leave a long-lived grandchild")
     parser.add_argument("--report", type=report, action="append", default=[], help="KEY=JSON")
+    parser.add_argument("--implements", default="dtls,tls", help="transports; others exit 2")
+    parser.add_argument("--tls-hello", choices=("echo", "drop", "alter"), help="client CH2 cookie")
     args = parser.parse_args()
     if args.role is None:
         parser.error("--role is required")
@@ -111,6 +117,8 @@ def parse_args(parser):
         args.variants_file, args.role
     ):
         parser.error(f"--variant={args.variant} is not a {args.role} variant")
+    if args.transport == "tls" and args.mtu != "default":
+        parser.error("--mtu must be default with --transport=tls")
     share = args.key_share
     if share not in (None, "empty", "default") and share not in args.groups.split(","):
         parser.error(f"--key-share={share} is not in --groups")
@@ -121,14 +129,105 @@ def emit(obj):
     print(json.dumps(obj), flush=True)
 
 
-def result(args, ok, error=None):
+def result(args, ok, error=None, connection=1):
     fields = {"version": None, "group": None, "hrr": None, "hrr_cookie": None, "hrr_group": None}
+    fields["resumed"] = connection == 2 if ok else None
     fields.update(args.report)
+    if error is not None and args.resume == "ticket":
+        error = f"connection {connection}: {error}"
     emit({"event": "result", "ok": ok, **fields, "error": error})
+
+
+# Synthetic TLS handshake messages (RFC 9846 sec 4.2.2, 4.2.4) carrying only a cookie extension.
+HRR_RANDOM = bytes.fromhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+COOKIE = b"echo-fixture-cookie"
+
+
+def tls_record(msg_type, body):
+    hs = bytes([msg_type]) + len(body).to_bytes(3) + body
+    return b"\x16\x03\x03" + len(hs).to_bytes(2) + hs
+
+
+def cookie_ext(cookie):
+    if cookie is None:
+        return b""
+    data = len(cookie).to_bytes(2) + cookie
+    return (44).to_bytes(2) + len(data).to_bytes(2) + data
+
+
+def client_hello(cookie):
+    exts = cookie_ext(cookie)
+    body = b"\x03\x03" + bytes(32) + b"\x00" + b"\x00\x02\x13\x01" + b"\x01\x00"
+    return tls_record(1, body + len(exts).to_bytes(2) + exts)
+
+
+def hello_retry_request():
+    exts = cookie_ext(COOKIE)
+    body = b"\x03\x03" + HRR_RANDOM + b"\x00" + b"\x13\x01\x00"
+    return tls_record(2, body + len(exts).to_bytes(2) + exts)
+
+
+def recv_exactly(conn, n):
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("connection closed early")
+        data += chunk
+    return data
+
+
+def recv_record(conn):
+    header = recv_exactly(conn, 5)
+    return header + recv_exactly(conn, int.from_bytes(header[3:5]))
+
+
+class Unsupported(Exception):
+    """Exit 2 with this error."""
 
 
 def hang():
     threading.Event().wait()
+
+
+def exchange(args, conn, peer=None):
+    """One connection's ping/pong; returns the error, or None."""
+    if args.role == "server":
+        if args.transport == "tls":
+            if args.tls_hello:
+                recv_record(conn)
+                conn.sendall(hello_retry_request())
+                recv_record(conn)
+            data = recv_exactly(conn, 4)
+        else:
+            data, peer = conn.recvfrom(2048)
+        if args.behave == "crash":
+            os.kill(os.getpid(), signal.SIGKILL)
+        if args.behave == "exit2-on-ping":
+            raise Unsupported("unsupported, found out during the handshake")
+        if data != b"ping":
+            return f"unexpected payload {data!r}"
+        if args.transport == "tls":
+            conn.sendall(b"pong")
+        else:
+            conn.sendto(b"pong", peer)
+        return None
+    if args.transport == "tls" and args.tls_hello:
+        conn.sendall(client_hello(None))
+        recv_record(conn)
+        echoed = {"echo": COOKIE, "drop": None, "alter": COOKIE[::-1]}[args.tls_hello]
+        conn.sendall(client_hello(echoed))
+    if args.transport == "tls":
+        conn.sendall(b"ping")
+        data = recv_exactly(conn, 4)
+    else:
+        conn.send(b"ping")
+        data = conn.recv(2048)
+    if args.behave == "crash":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if data != b"pong":
+        return f"unexpected payload {data!r}"
+    return None
 
 
 def main():
@@ -141,13 +240,21 @@ def main():
     if args.behave == "exit2":
         result(args, False, f"{args.role}: configuration not supported")
         return 2
+    if args.transport not in args.implements.split(","):
+        result(args, False, f"{args.transport} transport not implemented")
+        return 2
     if args.behave == "garbage":
         print("this is not JSON", flush=True)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(RECV_TIMEOUT)
+    kind = socket.SOCK_STREAM if args.transport == "tls" else socket.SOCK_DGRAM
+    connections = 2 if args.resume == "ticket" else 1
+    sock = None
     if args.role == "server":
+        sock = socket.socket(socket.AF_INET, kind)
+        sock.settimeout(RECV_TIMEOUT)
         sock.bind((args.host, args.port))
+        if args.transport == "tls":
+            sock.listen()
         if args.behave == "never-ready":
             hang()
         if args.behave == "ready-no-port":
@@ -156,35 +263,37 @@ def main():
         emit({"event": "ready", "port": sock.getsockname()[1]})
         if args.behave == "hang":
             hang()
-        data, peer = sock.recvfrom(2048)
-        if args.behave == "crash":
-            os.kill(os.getpid(), signal.SIGKILL)
-        if args.behave == "exit2-on-ping":
-            result(args, False, "unsupported, found out during the handshake")
+    elif args.behave == "hang":
+        hang()
+    for n in range(1, connections + 1):
+        # The client opens a new socket per connection, so connection 2 has a new source port.
+        if args.role == "server" and args.transport == "tls":
+            conn, _ = sock.accept()
+            conn.settimeout(RECV_TIMEOUT)
+        elif args.role == "server":
+            conn = sock
+        else:
+            conn = socket.socket(socket.AF_INET, kind)
+            conn.settimeout(RECV_TIMEOUT)
+            conn.connect((args.host, args.port))
+        try:
+            error = exchange(args, conn)
+        except Unsupported as e:
+            result(args, False, str(e), n)
             return 2
-        if data != b"ping":
-            result(args, False, f"unexpected payload {data!r}")
-            return 1
-        sock.sendto(b"pong", peer)
-    else:
-        if args.behave == "hang":
-            hang()
-        sock.connect((args.host, args.port))
-        sock.send(b"ping")
-        data = sock.recv(2048)
-        if args.behave == "crash":
-            os.kill(os.getpid(), signal.SIGKILL)
-        if data != b"pong":
-            result(args, False, f"unexpected payload {data!r}")
+        if conn is not sock:
+            conn.close()
+        if error is not None:
+            result(args, False, error, n)
             return 1
 
     if args.behave == "fail":
-        result(args, False, "simulated handshake failure")
+        result(args, False, "simulated handshake failure", connections)
         return 1
     if args.behave == "bad-result":
         emit({"event": "result", "ok": True})
         return 0
-    result(args, True)
+    result(args, True, connection=connections)
     return 0
 
 

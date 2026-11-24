@@ -16,6 +16,10 @@ REQUIRED_ENV = "DTLS_INTEROP_REQUIRE"
 
 DEFAULT_VARIANT = "default"
 VARIANTS_FILE = "variants"
+TRANSPORTS_FILE = "transports"
+# Transports of an implementation without a transports file (docs/shim-interface.md).
+DEFAULT_TRANSPORTS = frozenset({"dtls"})
+KNOWN_TRANSPORTS = frozenset({"dtls", "tls"})
 VARIANT_SEPARATOR = "+"
 CLIENT = "client"
 SERVER = "server"
@@ -34,6 +38,8 @@ class Implementation:
     variant_description: str | None = None
     # Roles this entry runs in; default entries run in both.
     roles: frozenset[str] = BOTH_ROLES
+    # Declared in implementations/<name>/transports; variants inherit them.
+    transports: frozenset[str] = DEFAULT_TRANSPORTS
 
     @property
     def id(self) -> str:
@@ -88,6 +94,23 @@ def read_variants(path: Path) -> list[Variant]:
     return variants
 
 
+def read_transports(path: Path) -> frozenset[str]:
+    """Parse a transports file (one of KNOWN_TRANSPORTS per line); a missing file means dtls."""
+    if not path.is_file():
+        return DEFAULT_TRANSPORTS
+    found: set[str] = set()
+    for number, line in enumerate(path.read_text().splitlines(), start=1):
+        word = line.strip()
+        if not word:
+            continue
+        if word not in KNOWN_TRANSPORTS or word in found:
+            raise ValueError(f"{path}:{number}: unknown or duplicate transport {word!r}")
+        found.add(word)
+    if not found:
+        raise ValueError(f"{path}: lists no transport")
+    return frozenset(found)
+
+
 def discover(
     implementations_dir: Path = IMPLEMENTATIONS_DIR, build_dir: Path = BUILD_DIR
 ) -> list[Implementation]:
@@ -100,6 +123,7 @@ def discover(
             adapter=build_script.parent / "run",
             build_script=build_script,
             prefix=build_dir / name,
+            transports=read_transports(build_script.parent / TRANSPORTS_FILE),
         )
         found.append(base)
         for variant in read_variants(build_script.parent / VARIANTS_FILE):
@@ -112,6 +136,7 @@ def discover(
                     variant=variant.name,
                     variant_description=variant.description,
                     roles=variant.roles,
+                    transports=base.transports,
                 )
             )
     return found

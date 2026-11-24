@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from dtls_interop.hello_trace import FlowHellos, trace_flows
 from dtls_interop.implementations import CLIENT, DEFAULT_VARIANT, SERVER, Implementation
 from dtls_interop.pki import TestPki
 from dtls_interop.proxy import FORWARD, Datagram, Packet, Rule, UdpProxy, Verdict, drop
@@ -35,6 +36,7 @@ from dtls_interop.records import (
     reassemble,
 )
 from dtls_interop.runner import parse_result_line
+from dtls_interop.tcp_proxy import TcpProxy
 
 HOST = "127.0.0.1"
 # A loopback port nothing listens on, for clients that must fail before connecting.
@@ -57,12 +59,14 @@ GROUP_CODES = {
 }
 X25519, MLKEM, P256 = "X25519", "X25519MLKEM768", "secp256r1"
 
+_COMMON = ("role", "variant", "host", "port", "groups", "transport", "resume", "mtu", "ca")
 ROLE_OPTIONS = {
-    CLIENT: ("role", "variant", "host", "port", "groups", "mtu", "ca", "key-share"),
-    SERVER: ("role", "variant", "host", "port", "groups", "mtu", "ca", "validate", "cert", "key"),
+    CLIENT: (*_COMMON, "key-share"),
+    SERVER: (*_COMMON, "validate", "cert", "key"),
 }
-RESULT_KEYS = {"event", "ok", "version", "group", "hrr", "hrr_cookie", "hrr_group", "error"}
-HANDSHAKE_KEYS = ("version", "group", "hrr", "hrr_cookie", "hrr_group")
+HANDSHAKE_KEYS = ("version", "group", "hrr", "hrr_cookie", "hrr_group", "resumed")
+RESULT_KEYS = {"event", "ok", *HANDSHAKE_KEYS, "error"}
+VERSIONS = {"dtls": "DTLSv1.3", "tls": "TLSv1.3"}
 
 type Options = list[tuple[str, str]]
 
@@ -228,7 +232,7 @@ def render(opts: Options, form: str) -> list[str]:
 class Pair:
     client: Run | None  # None: the server never became ready
     server: Run
-    trace: list[Datagram]
+    trace: list[Any]  # Datagrams, or Segments with --transport=tls
     t0: float  # time.monotonic() at proxy start; trace times are relative to it
 
     @property
@@ -252,6 +256,8 @@ class Harness:
             "host": HOST,
             "port": "0" if role == SERVER else str(UNUSED_PORT),
             "groups": X25519,
+            "transport": "dtls",
+            "resume": "off",
             "mtu": "1500",
             "ca": str(self.pki.ca_cert),
         }
@@ -284,11 +290,15 @@ class Harness:
         client_may_be_unsupported: bool = False,
     ) -> Pair:
         """Server, then a proxy without PMTU limit (sizes are checked on the trace), then client.
-        Skips when a side exits 2, unless the caller checks an unsupported client itself."""
+        Skips when a side exits 2, unless the caller checks an unsupported client itself.
+        With --transport=tls the proxy is the runner's TCP relay.
+        """
         sopts = self.options(case.server, SERVER, **(server or {}))
         srv = self.start(case.server, SERVER, render(sopts, form))
         port = await_ready(srv)
-        with UdpProxy((HOST, port), pmtu=None, rules=rules) as proxy:
+        tls = dict(sopts)["transport"] == "tls"
+        proxy_cm = TcpProxy((HOST, port)) if tls else UdpProxy((HOST, port), pmtu=None, rules=rules)
+        with proxy_cm as proxy:
             t0 = time.monotonic()
             copts = self.options(case.client, CLIENT, port=str(proxy.address[1]), **(client or {}))
             cli = self.start(case.client, CLIENT, render(copts, form))
@@ -362,7 +372,7 @@ def check_protocol(run: Run | None) -> dict[str, Any]:
     assert isinstance(result["ok"], bool), ctx
     for key in ("version", "group", "error"):
         assert result[key] is None or isinstance(result[key], str), f"{key}\n{ctx}"
-    for key in ("hrr", "hrr_cookie", "hrr_group"):
+    for key in ("hrr", "hrr_cookie", "hrr_group", "resumed"):
         assert result[key] is None or isinstance(result[key], bool), f"{key}\n{ctx}"
     assert run.code in (EXIT_OK, EXIT_FAIL, EXIT_UNSUPPORTED, EXIT_USAGE), ctx
     assert result["ok"] is (run.code == EXIT_OK), f"ok contradicts the exit code\n{ctx}"
@@ -380,10 +390,20 @@ def check_protocol(run: Run | None) -> dict[str, Any]:
     return result
 
 
-def check_ok(run: Run | None, group: str, *, hrr: bool, cookie: bool, hrr_group: bool) -> None:
+def check_ok(
+    run: Run | None,
+    group: str,
+    *,
+    hrr: bool,
+    cookie: bool,
+    hrr_group: bool,
+    transport: str = "dtls",
+    resumed: bool = False,
+) -> None:
     result = check_protocol(run)
-    expected = {"event": "result", "ok": True, "version": "DTLSv1.3", "group": group}
-    expected |= {"hrr": hrr, "hrr_cookie": cookie, "hrr_group": hrr_group, "error": None}
+    expected = {"event": "result", "ok": True, "version": VERSIONS[transport], "group": group}
+    expected |= {"hrr": hrr, "hrr_cookie": cookie, "hrr_group": hrr_group}
+    expected |= {"resumed": resumed, "error": None}
     assert result == expected, run.describe() if run else ""
 
 
@@ -415,6 +435,26 @@ def check_hrr_on_wire(pair: Pair, cookie: bool | None = None) -> bool:
         result = check_protocol(run)
         assert {k: result[k] for k in seen} == seen, f"{pair.wire}\n{run and run.describe()}"
     return wire_cookie
+
+
+def check_hrr_per_flow(pair: Pair, cookie: bool | None = None) -> list[FlowHellos]:
+    """check_hrr_on_wire for UDP or TCP traces with one flow per connection (--resume=ticket).
+    Every flow must match cookie; the result lines describe the last flow."""
+    flows = trace_flows(pair.trace)
+    assert flows, f"no flows in the trace: {pair.trace!r}"
+    for f in flows:
+        wire_cookie = f.hrr is not None and f.hrr.cookie
+        if cookie is None:
+            assert not (wire_cookie and f.hrr.selected_group is None), f"cookie-only HRR: {f}"
+        else:
+            assert wire_cookie is cookie, f
+    last = flows[-1].hrr
+    seen = {"hrr": last is not None, "hrr_cookie": last is not None and last.cookie}
+    seen["hrr_group"] = last is not None and last.selected_group is not None
+    for run in (pair.client, pair.server):
+        result = check_protocol(run)
+        assert {k: result[k] for k in seen} == seen, f"{flows}\n{run and run.describe()}"
+    return flows
 
 
 def unsupported(run: Run | None) -> bool:

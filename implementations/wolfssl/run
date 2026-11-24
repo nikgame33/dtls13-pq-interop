@@ -3,7 +3,7 @@
 bin="$(dirname "$0")/../../.build/wolfssl/bin/wolfssl-adapter"
 if [ ! -x "$bin" ]; then
     echo "wolfssl adapter not built; run implementations/wolfssl/build.sh" >&2
-    echo '{"event": "result", "ok": false, "version": null, "group": null, "hrr": null, "hrr_cookie": null, "hrr_group": null, "error": "adapter not built"}'
+    echo '{"event": "result", "ok": false, "version": null, "group": null, "hrr": null, "hrr_cookie": null, "hrr_group": null, "resumed": null, "error": "adapter not built"}'
     exit 1
 fi
 exec "$bin" "$@"

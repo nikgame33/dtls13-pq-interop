@@ -38,13 +38,16 @@ def test_scenario_is_consistent(scenario):
     assert set(client.groups) <= KNOWN_GROUPS
     assert set(server.groups) <= KNOWN_GROUPS
     assert client.key_share == EMPTY_KEY_SHARE or client.key_share in client.groups
-    if scenario.path.split_ch1 is None:
+    if scenario.transport is Transport.TLS:
+        assert client.mtu == server.mtu == scenarios.DEFAULT
+    elif scenario.path.split_ch1 is None:
         assert client.mtu == server.mtu == scenario.path.pmtu
     else:
         assert client.mtu == scenario.path.pmtu
     if scenario.expected.group is not None:
         assert scenario.expected.group in set(client.groups) & set(server.groups)
     exp = scenario.expected
+    assert exp.resumed in (None, scenario.resumption)
     if exp.hrr is False:
         assert exp.hrr_cookie is False and exp.hrr_group is False
     if scenario.server.validate is Validate.COOKIE:

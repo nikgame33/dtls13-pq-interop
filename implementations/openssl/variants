@@ -1,1 +1,1 @@
-server accept: Server runs SSL_accept() on a UDP socket connected to the first peer instead of the DTLS listener API; --validate=cookie uses SSL_OP_COOKIE_EXCHANGE with application cookie callbacks.
+server accept: Server runs SSL_accept() on a UDP socket connected to the first peer instead of the DTLS listener API, so it is DTLS only; --validate=cookie uses SSL_OP_COOKIE_EXCHANGE with application cookie callbacks.

@@ -1,11 +1,14 @@
-"""OpenSSL adapter self-interop on loopback, without the proxy (real builds, real UDP sockets)."""
+"""OpenSSL adapter self-interop on loopback, without the proxy (real builds, UDP/TCP sockets)."""
 
 from __future__ import annotations
 
 import json
 import re
 import select
+import socket
+import ssl
 import subprocess
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,6 +79,8 @@ class Adapters:
             "host": HOST,
             "port": str(port),
             "groups": "X25519",
+            "transport": "dtls",
+            "resume": "off",
             "mtu": "1500",
             "ca": str(self.pki.ca_cert),
         }
@@ -135,9 +140,18 @@ def _handshake(adapters: Adapters, server: dict, client: dict) -> tuple[Run, Run
     return cli, srv.finish()
 
 
-def _assert_ok(run: Run, group: str, hrr: bool, cookie: bool = False, hrr_group: bool = False):
-    expected = {"event": "result", "ok": True, "version": "DTLSv1.3", "group": group}
-    expected |= {"hrr": hrr, "hrr_cookie": cookie, "hrr_group": hrr_group, "error": None}
+def _assert_ok(
+    run: Run,
+    group: str,
+    hrr: bool,
+    cookie: bool = False,
+    hrr_group: bool = False,
+    resumed: bool = False,
+    version: str = "DTLSv1.3",
+) -> None:
+    expected = {"event": "result", "ok": True, "version": version, "group": group}
+    expected |= {"hrr": hrr, "hrr_cookie": cookie, "hrr_group": hrr_group}
+    expected |= {"resumed": resumed, "error": None}
     assert (run.code, run.result) == (0, expected), run.stderr
 
 
@@ -307,7 +321,8 @@ def test_empty_key_share_triggers_hrr(adapters: Adapters) -> None:
 
 def _assert_no_handshake(run: Run, code: int, error: str) -> None:
     expected = {"event": "result", "ok": False, "version": None, "group": None, "hrr": None}
-    expected |= {"hrr_cookie": None, "hrr_group": None, "error": run.result["error"]}
+    expected |= {"hrr_cookie": None, "hrr_group": None, "resumed": None}
+    expected["error"] = run.result["error"]
     assert (run.code, run.result) == (code, expected), run.stderr
     assert error in run.result["error"], run.result
 
@@ -344,6 +359,11 @@ USAGE_ERRORS = {
         "server-variant": {"variant": "accept"},
         "share-not-in-groups": {"key_share": MLKEM},
         "empty-group": {"groups": "X25519,,X448"},
+        "missing-transport": {"transport": None},
+        "bad-transport": {"transport": "quic"},
+        "missing-resume": {"resume": None},
+        "bad-resume": {"resume": "psk"},
+        "tls-numeric-mtu": {"transport": "tls", "mtu": "1500"},
     },
     "server": {
         "missing-validate": {"validate": None},
@@ -354,6 +374,11 @@ USAGE_ERRORS = {
         "bad-port": {"port": "70000"},
         "bad-mtu": {"mtu": "48"},
         "bad-variant": {"variant": "nope"},
+        "missing-transport": {"transport": None},
+        "bad-transport": {"transport": "TLS"},
+        "missing-resume": {"resume": None},
+        "bad-resume": {"resume": "on"},
+        "tls-numeric-mtu": {"transport": "tls", "mtu": "1280"},
     },
 }
 
@@ -383,3 +408,148 @@ def test_client_rejects_untrusted_server(adapters: Adapters, tmp_path: Path) -> 
     assert cli.result["ok"] is False
     assert "certificate verify failed" in cli.result["error"]
     assert srv.finish().code == 1
+
+
+TLS = {"transport": "tls", "mtu": "default"}
+
+
+@pytest.mark.parametrize("validate", ["off", "cookie"])
+def test_tls_x25519_self_interop(listener: Adapters, validate: str) -> None:
+    """TLS 1.3 over TCP; with cookie, SSL_stateless() answers CH1 with a cookie-only HRR."""
+    cookie = validate == "cookie"
+    cli, srv = _handshake(
+        listener,
+        server=TLS | {"validate": validate},
+        client=TLS | {"key_share": "X25519"},
+    )
+    for run in (cli, srv):
+        _assert_ok(run, "X25519", hrr=cookie, cookie=cookie, version="TLSv1.3")
+        assert "<< alert close notify" in run.stderr, run.stderr
+        assert ">> datagram" not in run.stderr, run.stderr
+    assert cli.stderr.count(">> ClientHello") == (2 if cookie else 1), cli.stderr
+
+
+def test_tls_cookie_and_wrong_guess_share_one_hrr(listener: Adapters) -> None:
+    """The TLS HRR is parsed with its 4-byte handshake header, so selected_group is found too."""
+    cli, srv = _handshake(
+        listener,
+        server=TLS | {"groups": MLKEM, "validate": "cookie"},
+        client=TLS | {"groups": f"{MLKEM},X25519", "key_share": "X25519"},
+    )
+    _assert_ok(cli, MLKEM, hrr=True, cookie=True, hrr_group=True, version="TLSv1.3")
+    _assert_ok(srv, MLKEM, hrr=True, cookie=True, hrr_group=True, version="TLSv1.3")
+
+
+def test_dtls_only_variant_with_tls_is_unsupported(require_impl, test_pki, tmp_path) -> None:
+    a = Adapters(require_impl("openssl").adapter, test_pki, tmp_path, "accept")
+    run = a.run(a.args("server", **TLS))
+    _assert_no_handshake(run, 2, "DTLS only")
+
+
+def _local_ports(client: Run) -> list[int]:
+    return [int(p) for p in re.findall(r"^socket: local port (\d+)$", client.stderr, re.M)]
+
+
+def _assert_resumed(cli: Run, srv: Run, group: str, cookie: bool, version: str) -> None:
+    for run in (cli, srv):
+        _assert_ok(run, group, hrr=cookie, cookie=cookie, resumed=True, version=version)
+        assert run.stderr.count("handshake done:") == 2, run.stderr
+    ports = _local_ports(cli)
+    assert len(ports) == 2 and ports[0] != ports[1], cli.stderr
+    # Connection 1 is a full handshake with a certificate; connection 2 resumes without one.
+    assert srv.stderr.count(">> Certificate (") == 1, srv.stderr
+    # A cookie HRR on each connection means two ClientHellos per connection.
+    assert cli.stderr.count(">> ClientHello") == (4 if cookie else 2), cli.stderr
+
+
+def test_s10_dtls_resumption_after_cookie(adapters: Adapters) -> None:
+    """S10: connection 2 comes from a new port, gets a cookie HRR and still resumes."""
+    common = {"groups": MLKEM, "mtu": "1280", "resume": "ticket"}
+    cli, srv = _handshake(
+        adapters,
+        server=common | {"validate": "cookie"},
+        client=common | {"key_share": MLKEM},
+    )
+    _assert_resumed(cli, srv, MLKEM, cookie=True, version="DTLSv1.3")
+    _assert_fits(cli, 1280)
+    _assert_fits(srv, 1280)
+
+
+def test_dtls_resumption_without_validation(adapters: Adapters) -> None:
+    cli, srv = _handshake(adapters, server={"resume": "ticket"}, client={"resume": "ticket"})
+    _assert_resumed(cli, srv, "X25519", cookie=False, version="DTLSv1.3")
+
+
+def test_tls_resumption_without_validation(listener: Adapters) -> None:
+    ticket = TLS | {"resume": "ticket"}
+    cli, srv = _handshake(listener, server=ticket, client=ticket)
+    _assert_resumed(cli, srv, "X25519", cookie=False, version="TLSv1.3")
+
+
+def test_tls_resumption_after_stateful_hrr(listener: Adapters) -> None:
+    """A key-share HRR keeps the server's state, and the binder over CH1 + HRR verifies."""
+    ticket = TLS | {"resume": "ticket", "groups": f"{MLKEM},X25519"}
+    cli, srv = _handshake(
+        listener,
+        server=ticket | {"groups": MLKEM},
+        client=ticket | {"key_share": "X25519"},
+    )
+    for run in (cli, srv):
+        _assert_ok(run, MLKEM, hrr=True, hrr_group=True, resumed=True, version="TLSv1.3")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="OpenSSL 4.1.0 SSL_stateless(): ssl_get_prev_session() checks the PSK binder before "
+    "tls_parse_ctos_cookie() restores hello_retry_request=SSL_HRR_PENDING (SSL_clear reset it), "
+    "so tls_psk_do_binder() hashes CH2 without CH1 + HRR and fails with binder does not verify",
+)
+def test_tls_resumption_after_cookie(listener: Adapters) -> None:
+    ticket = TLS | {"resume": "ticket"}
+    cli, srv = _handshake(
+        listener,
+        server=ticket | {"validate": "cookie"},
+        client=ticket | {"key_share": "X25519"},
+    )
+    # Any other failure is not the known limitation and must not be absorbed by the xfail.
+    if (
+        srv.code != 0
+        and srv.result["error"] != "connection 2: stateless HRR: binder does not verify"
+    ):
+        raise RuntimeError(f"unexpected server result {srv.result}:\n{srv.stderr}")
+    _assert_resumed(cli, srv, "X25519", cookie=True, version="TLSv1.3")
+
+
+def _serve_without_tickets(test_pki: pki.TestPki, listening: socket.socket) -> None:
+    """A Python ssl (system OpenSSL) TLS 1.3 server that issues no NewSessionTicket."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(test_pki.server_cert, test_pki.server_key)
+    ctx.num_tickets = 0
+    conn, _ = listening.accept()
+    with ctx.wrap_socket(conn, server_side=True) as tls:
+        assert tls.recv(4) == b"ping"
+        tls.sendall(b"pong")
+        tls.unwrap()
+
+
+def test_client_without_ticket_fails(listener: Adapters, test_pki: pki.TestPki) -> None:
+    with socket.create_server((HOST, 0)) as listening:
+        thread = threading.Thread(target=_serve_without_tickets, args=(test_pki, listening))
+        thread.start()
+        port = listening.getsockname()[1]
+        cli = listener.run(listener.args("client", port, resume="ticket", **TLS))
+        thread.join(TIMEOUT)
+    expected = {"event": "result", "ok": False, "version": "TLSv1.3", "group": "X25519"}
+    expected |= {"hrr": False, "hrr_cookie": False, "hrr_group": False, "resumed": False}
+    expected["error"] = "connection 1: no session ticket received"
+    assert (cli.code, cli.result) == (1, expected), cli.stderr
+    assert len(_local_ports(cli)) == 1, cli.stderr
+
+
+def test_resume_errors_name_the_connection(listener: Adapters) -> None:
+    """With --resume=ticket an error before connection 1 is already prefixed."""
+    run = listener.run(listener.args("client", 1, resume="ticket", groups="MLKEM512X25519"))
+    _assert_no_handshake(run, 2, "MLKEM512X25519")
+    assert run.result["error"].startswith("connection 1: "), run.result

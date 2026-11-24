@@ -32,6 +32,8 @@ MALFORMED = {
     "groups": [",", "X25519,", ",X25519", "X25519,,secp256r1"],
     "mtu": ["abc", "-1", "0", "48", "1280x"],
     "validate": ["maybe", "on"],
+    "transport": ["udp", "DTLS", "quic"],
+    "resume": ["on", "psk", "Ticket"],
     # The baseline --groups is X25519 only.
     "key-share": [P256, MLKEM],
 }
@@ -88,6 +90,8 @@ def usage_cases(subject: Subject, entries: list[implementations.Implementation])
         UsageCase("positional-argument", lambda o: o, ("stray",)),
         UsageCase("missing-value", lambda o: _drop(o, "mtu"), ("--mtu",)),
         UsageCase("unknown-variant", lambda o: _set(o, "variant", "no-such-variant")),
+        # The baseline --mtu is 1500, and a byte stream has no datagram size.
+        UsageCase("tls-with-numeric-mtu", lambda o: _set(o, "transport", "tls")),
     ]
     # Variants listed only for the other role.
     for e in entries:

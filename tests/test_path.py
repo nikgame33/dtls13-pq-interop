@@ -115,5 +115,21 @@ def test_pmtu_drops_are_counted(server, client):
     assert summary.ch1 == path.ClientHelloSummary(size=CH_LEN, fragments=1)
 
 
+def test_summary_describes_the_last_connection(server):
+    # Two client sockets are two proxy flows, as with --resume=ticket.
+    first = [ch_record(0, 1000, record_seq=0), ch_record(1000, 400, record_seq=1)]
+    second = [ch_record(0, CH_LEN, record_seq=0)]
+    with path.proxy_path(server.getsockname(), PathConditions(pmtu=1500)) as proxy:
+        for datagrams in (first, second):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+                for d in datagrams:
+                    c.sendto(d, proxy.address)
+                for _ in datagrams:
+                    server.recv(4096)
+
+    assert {d.flow for d in proxy.trace} == {0, 1}
+    assert path.summarize(proxy.trace).ch1 == path.ClientHelloSummary(size=CH_LEN, fragments=1)
+
+
 def test_summary_ignores_foreign_trace_entries():
     assert path.summarize([object()]) == path.TraceSummary(ch1=None, ch2=None, actions={})
