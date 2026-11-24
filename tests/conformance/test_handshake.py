@@ -27,15 +27,16 @@ def _codes(*groups: str) -> tuple[int, ...]:
 
 
 # (server --groups, client --groups, client --key-share, negotiated group, HRR expected)
+# The share is the client's first group, so clients that cannot pick another share (NSS) qualify.
 SELECTION = {
     "rule1-share-beats-server-preference": (
         (MLKEM, X25519),
-        (MLKEM, X25519),
+        (X25519, MLKEM),
         X25519,
         X25519,
         False,
     ),
-    "rule1-pq-share": ((X25519, MLKEM), (X25519, MLKEM), MLKEM, MLKEM, False),
+    "rule1-pq-share": ((X25519, MLKEM), (MLKEM, X25519), MLKEM, MLKEM, False),
     "rule2-server-rank": ((MLKEM, X25519), (P256, X25519, MLKEM), P256, MLKEM, True),
     "rule2-server-rank-reversed": ((X25519, MLKEM), (P256, MLKEM, X25519), P256, X25519, True),
     "rule2-client-supported-only": ((MLKEM, X25519), (P256, X25519), P256, X25519, True),
@@ -126,7 +127,7 @@ def test_client_default_key_share(client_subject: Subject, harness: Harness) -> 
 
 
 def test_client_supported_groups_in_order(client_subject: Subject, harness: Harness) -> None:
-    groups = (P256, MLKEM, X25519)
+    groups = (X25519, P256, MLKEM)
     p = harness.pair(
         PairCase(client_subject.impl, client_subject.peer),
         client={"groups": ",".join(groups), "key_share": X25519},
