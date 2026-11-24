@@ -38,7 +38,7 @@ Every scenario runs for every (client, server) pair, including same-implementati
 ## Proxy-split rows
 
 The wolfSSL client never fragments CH1: if CH1 does not fit its MTU, it sends an empty `key_share` instead.
-So S03, S04, S08 and S09 never show a server a fragmented CH1 from it.
+So S03, S04, S08 and S09 never show a server a fragmented CH1 from it; with `--key-share=GROUP` the adapter reports them as unsupported once PR #9 lands.
 Each scenario that expects a fragmented CH1 therefore also runs as `<ID>+split` ([ADR 0003](adr/0003-proxy-split-ch1-rows.md)).
 Client `--mtu` and PMTU are 1500, so a full-share CH1 fits one datagram, and the proxy delivers an unfragmented CH1 as two fragments.
 Server options, impairments and expectations are those of the base row, except that the client's CH1 fragmentation is not checked.

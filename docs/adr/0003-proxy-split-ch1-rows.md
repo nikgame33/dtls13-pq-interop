@@ -8,13 +8,14 @@ S03, S04, S08 and S09 test how a server handles a fragmented first ClientHello (
 The wolfSSL 5.9.4 client never fragments CH1 (RFC 9147 sec 5.5 would allow it).
 If CH1 does not fit its MTU it sends an empty `key_share` instead (`src/tls13.c`, "Sending empty key share so we don't fragment CH1").
 At `--mtu=1280` its CH1 shrinks from 1378 to 158 bytes of message, so these rows only exercise the HRR path for wolfSSL clients, never server reassembly.
+The conformance work (PR #9) makes the wolfSSL adapter exit 2 (unsupported) instead when `--key-share=GROUP` would be replaced this way, so the base rows then report wolfSSL clients as unsupported.
 
 The proxy rule `SplitClientHello` (ADR 0001) can deliver an unfragmented CH1 as several fragments.
 The matrix needs a way to use it that no reader can mistake for the client fragmenting CH1.
 
 Two facts constrain the options:
 
-- The client only sends its full share if CH1 fits its own MTU, so the client `--mtu` must be raised (a 1403-byte datagram needs at least 1451).
+- The client only sends its full share if CH1 fits its own MTU, so the client `--mtu` must be raised (a 1403-byte datagram needs at least 1451); with PR #9 the adapter refuses to run otherwise.
 - With a raised client MTU on a 1280 path, the client's other datagrams no longer fit the path.
 Measured: after the cookie HRR, wolfSSL fragments its 1524-byte CH2 at its own 1452-byte limit, and the proxy drops the first fragment for exceeding the PMTU, so S04 never completes.
 
