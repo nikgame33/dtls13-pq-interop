@@ -38,7 +38,10 @@ if [[ ! -f "$STAMP" || "$(cat "$STAMP")" != "$STAMP_CONTENT" ]]; then
     tar -xzf "$ARCHIVE" -C "$PREFIX/src"
     grep -q "^#define NSS_VERSION \"$VERSION\" " "$SRC/nss/lib/nss/nss.h"
     grep -q "^#define PR_VERSION \"$NSPR_VERSION\"$" "$SRC/nspr/pr/include/prinit.h"
-    make -C "$SRC/nss" -j"$(nproc)" nss_build_all "${MAKE_FLAGS[@]}" >"$PREFIX/make.log" 2>&1
+    if ! make -C "$SRC/nss" -j"$(nproc)" nss_build_all "${MAKE_FLAGS[@]}" >"$PREFIX/make.log" 2>&1; then
+        tail -n 60 "$PREFIX/make.log" >&2
+        exit 1
+    fi
     # NSS installs nothing itself; dist/ holds symlinks into the source tree, hence -L.
     dist="$SRC/dist/$(cat "$SRC/dist/latest")"
     mkdir -p "$INSTALL/lib" "$INSTALL/include"
