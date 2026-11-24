@@ -35,11 +35,29 @@ Every scenario runs for every (client, server) pair, including same-implementati
 | S10 | PSK resumption after HRR at PMTU 1280 | Succeeds |
 | T01 | TLS 1.3 HRR cookie echo (incl. mbedtls) | Cookie echoed in CH2 |
 
+## Proxy-split rows
+
+The wolfSSL client never fragments CH1: if CH1 does not fit its MTU, it sends an empty `key_share` instead.
+So S03, S04, S08 and S09 never show a server a fragmented CH1 from it.
+Each scenario that expects a fragmented CH1 therefore also runs as `<ID>+split` ([ADR 0003](adr/0003-proxy-split-ch1-rows.md)).
+Client `--mtu` and PMTU are 1500, so a full-share CH1 fits one datagram, and the proxy delivers an unfragmented CH1 as two fragments.
+Server options, impairments and expectations are those of the base row, except that the client's CH1 fragmentation is not checked.
+Every client runs these rows; clients that fragment CH1 themselves are the control.
+
+| ID | Description | Expected outcome |
+|---|---|---|
+| S03+split | S03, client MTU and PMTU 1500, proxy splits CH1 in two | As S03; CH1 reaches the server in 2 fragments |
+| S04+split | S04, client MTU and PMTU 1500, proxy splits CH1 in two | As S04; CH1 reaches the server in 2 fragments |
+| S08+split | S08, client MTU and PMTU 1500, proxy splits CH1 in two | As S08; CH1 reaches the server in 2 fragments |
+| S09+split | S09, client MTU and PMTU 1500, proxy splits CH1 in two | As S09; CH1 reaches the server in 2 fragments |
+
 ## Recorded per run
 
 - Outcome: pass, fail (with alert / error), unsupported (adapter exit 2), timeout, error (harness or adapter protocol problem, not a library verdict).
 - Datagram trace from the proxy: direction, size, timing and action per datagram.
 Record and handshake headers are derived with `records.parse_datagram(d.payload)` on each trace entry.
-- CH1/CH2 total size and fragment count.
+- CH1/CH2 message size and fragment count as the client sent them, before any proxy rule.
+A run fails if they contradict the scenario's CH1/CH2 fragmentation expectation.
+- Path: PMTU, impairments, `split_ch1` (the proxy, not the client, split CH1), and `actions`: how many datagrams the proxy dropped, delayed or replaced, by reason (e.g. `replaced: split CH1 into 2 fragments`).
 - Round trips to completion.
 - Bytes sent by the server before address validation (amplification ratio vs. bytes received).

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 # Bump on any incompatible change to CaseResult; readers reject other versions.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RESULT_FILE = "result.json"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
@@ -60,6 +60,10 @@ class PathRecord:
     proxied: bool
     pmtu: int
     impairments: list[str]
+    # The proxy, not the client, cut CH1 into this many fragments (ADR 0003); None: no split.
+    split_ch1: int | None
+    # From the trace: "action: reason" -> count for every datagram not simply forwarded.
+    actions: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,8 @@ class CaseResult:
     server: AdapterRecord
     path: PathRecord
     trace: str | None
+    # CH1/CH2 as the client sent them, before proxy rules: message length, fragments in the
+    # first transmission. None without a proxy trace or if the client sent no such message.
     ch1_size: int | None = None
     ch1_fragments: int | None = None
     ch2_size: int | None = None

@@ -45,6 +45,7 @@ def test_list(impl_root, module):
     assert "  echo-unbuilt  not built" in lines
     assert "  S01  X25519, full share, PMTU 1500, no validation" in lines
     assert any(line.startswith("  T01  ") for line in lines)
+    assert "  S08+split  S08, client MTU and PMTU 1500, proxy splits CH1 in two" in lines
 
 
 def test_run_all_built_pairs(impl_root, tmp_path):
@@ -96,20 +97,26 @@ def test_run_exit_code(impl_root, tmp_path):
     assert read_result(case).outcome is Outcome.FAIL
 
 
-def test_run_impaired_scenario_without_proxy_fails(impl_root, tmp_path):
+def test_run_impaired_and_split_scenarios_through_the_proxy(impl_root, tmp_path):
     results = tmp_path / "results"
     proc = cli(
         impl_root,
         "run",
-        "--scenario=s08",
+        "--scenario=s08,S09+split",
         "--client=echo-a",
         "--server=echo-a",
         f"--results-dir={results}",
     )
 
-    assert proc.returncode == 1
-    assert "S08  echo-a__echo-a  error" in proc.stdout
-    assert "path impairments not available" in proc.stdout
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "S08  echo-a__echo-a  pass" in proc.stdout
+    assert "S09+split  echo-a__echo-a  pass" in proc.stdout
+    [run_dir] = run_dirs(results)
+    s08, s09 = read_run(run_dir)
+    assert (s08.scenario, s09.scenario) == ("S08", "S09+split")
+    assert s08.path.proxied and s08.path.impairments == ["reorder-ch1"]
+    assert s09.path.proxied and s09.path.split_ch1 == 2
+    assert (run_dir / "S09+split" / "echo-a__echo-a" / "trace.jsonl").is_file()
 
 
 @pytest.mark.parametrize(

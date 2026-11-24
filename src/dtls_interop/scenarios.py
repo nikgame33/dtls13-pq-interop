@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 
@@ -47,6 +47,8 @@ class ServerOptions:
 class PathConditions:
     pmtu: int
     impairments: tuple[Impairment, ...] = ()
+    # The proxy delivers an unfragmented CH1 as this many fragments (ADR 0003); None: off.
+    split_ch1: int | None = None
 
 
 @dataclass(frozen=True)
@@ -59,7 +61,7 @@ class Expected:
     hrr: bool | None = None
     hrr_cookie: bool | None = None
     hrr_group: bool | None = None
-    # Checked against the proxy trace once CH1/CH2 analysis exists.
+    # Checked against the CH1/CH2 the client sent, as the proxy trace shows them.
     ch1_fragmented: bool | None = None
     ch2_fragmented: bool | None = None
     round_trips: int | None = None
@@ -249,8 +251,34 @@ def _build() -> tuple[Scenario, ...]:
     )
 
 
-SCENARIOS: tuple[Scenario, ...] = _build()
-_BY_ID = {s.id: s for s in SCENARIOS}
+# Suffix of the rows that rerun a fragmented-CH1 scenario with CH1 split by the proxy.
+SPLIT_SUFFIX = "+split"
+SPLIT_FRAGMENTS = 2
+# Lets a client that never fragments CH1 (wolfSSL) send its full share: CH1 must fit one datagram.
+SPLIT_CLIENT_MTU = 1500
+
+
+def _split_row(base: Scenario) -> Scenario:
+    """The base row with CH1 split by the proxy instead of by the client (ADR 0003)."""
+    return replace(
+        base,
+        id=base.id + SPLIT_SUFFIX,
+        description=f"{base.id}, client MTU and PMTU {SPLIT_CLIENT_MTU}, proxy splits CH1 in two",
+        client=replace(base.client, mtu=SPLIT_CLIENT_MTU),
+        path=replace(base.path, pmtu=SPLIT_CLIENT_MTU, split_ch1=SPLIT_FRAGMENTS),
+        expected=replace(
+            base.expected,
+            summary=f"As {base.id}; CH1 reaches the server in {SPLIT_FRAGMENTS} fragments",
+            ch1_fragmented=None,
+        ),
+    )
+
+
+_BASE = _build()
+SCENARIOS: tuple[Scenario, ...] = _BASE + tuple(
+    _split_row(s) for s in _BASE if s.expected.ch1_fragmented
+)
+_BY_ID = {s.id.upper(): s for s in SCENARIOS}
 
 
 def get(scenario_id: str) -> Scenario:

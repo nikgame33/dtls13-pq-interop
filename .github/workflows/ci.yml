@@ -69,3 +69,29 @@ jobs:
         env:
           DTLS_INTEROP_REQUIRE: ${{ matrix.name }}
         run: uv run pytest tests/impl/test_${{ matrix.name }}.py
+
+  matrix-e2e:
+    name: Matrix E2E (openssl, wolfssl)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv sync --locked
+      - uses: actions/cache@v6
+        with:
+          path: .build/openssl
+          key: build-openssl-${{ runner.os }}-${{ hashFiles('implementations/openssl/build.sh', 'implementations/openssl/*.patch') }}-${{ hashFiles('implementations/openssl/**') }}
+          restore-keys: |
+            build-openssl-${{ runner.os }}-${{ hashFiles('implementations/openssl/build.sh', 'implementations/openssl/*.patch') }}-
+      - uses: actions/cache@v6
+        with:
+          path: .build/wolfssl
+          key: build-wolfssl-${{ runner.os }}-${{ hashFiles('implementations/wolfssl/build.sh', 'implementations/wolfssl/*.patch') }}-${{ hashFiles('implementations/wolfssl/**') }}
+          restore-keys: |
+            build-wolfssl-${{ runner.os }}-${{ hashFiles('implementations/wolfssl/build.sh', 'implementations/wolfssl/*.patch') }}-
+      - run: implementations/openssl/build.sh
+      - run: implementations/wolfssl/build.sh
+      - name: CLI, runner and proxy against the real builds
+        env:
+          DTLS_INTEROP_REQUIRE: openssl,wolfssl
+        run: uv run pytest tests/e2e

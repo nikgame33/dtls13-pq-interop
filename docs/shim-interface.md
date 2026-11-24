@@ -86,6 +86,7 @@ The client's verdict is final once it has read `pong`; errors during teardown go
 Adapters impose no handshake timeout of their own below 60 s; the runner owns timeouts.
 Adapters stay in the process group the runner starts them in and never daemonize.
 The runner kills the group at the case timeout, and the server 5 s after the client has exited.
+Exit 2 or 64 decides the outcome whatever the peer does, so the runner then kills the peer at once.
 
 PSK resumption (scenario S10) and a TLS-over-TCP mode (scenario T01) are not defined yet.
 

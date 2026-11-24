@@ -16,10 +16,12 @@ from echo_adapter import ECHO_VERSION, child_pids, install, pid_alive
 
 from dtls_interop import implementations, runner, scenarios
 from dtls_interop.implementations import BOTH_ROLES
+from dtls_interop.proxy import FORWARD, Rule, UdpProxy
 from dtls_interop.results import (
     RESULT_FILE,
     SCHEMA_VERSION,
     Outcome,
+    PathRecord,
     RunLayout,
     SchemaError,
     read_result,
@@ -92,25 +94,50 @@ def test_pass_records_everything(tmp_path, layout, test_pki):
         f"--key={test_pki.server_key}",
     ]
     ready = json.loads((case_dir(layout) / "server.stdout").read_text().splitlines()[0])
+    client_port = next(a for a in result.client.command if a.startswith("--port="))
+    # By default the client talks to the proxy, which forwards to the server's port.
+    assert client_port != f"--port={ready['port']}"
     assert result.client.command[1:] == [
         "--role=client",
         "--variant=default",
         "--host=127.0.0.1",
-        f"--port={ready['port']}",
+        client_port,
         "--groups=X25519",
         "--mtu=1500",
         f"--ca={test_pki.ca_cert}",
         "--key-share=X25519",
     ]
-    assert result.path.proxied is False
-    assert result.path.pmtu == 1500
-    assert result.trace is None
+    assert result.path == PathRecord(
+        proxied=True, pmtu=1500, impairments=[], split_ch1=None, actions={}
+    )
+    assert result.trace == "trace.jsonl"
+    trace = [
+        json.loads(line) for line in (case_dir(layout) / result.trace).read_text().splitlines()
+    ]
+    assert [(d["direction"], bytes.fromhex(d["payload"]), d["action"]) for d in trace] == [
+        ("c2s", b"ping", "forwarded"),
+        ("s2c", b"pong", "forwarded"),
+    ]
+    # Plain UDP carries no ClientHello.
     assert result.ch1_size is None and result.ch2_fragments is None
 
     d = case_dir(layout)
     assert d.parent.parent.parent.name == layout.started.strftime("%Y-%m-%d")
     assert '"event": "ready"' in (d / result.server.stdout_log).read_text()
     assert re.search(r"pid=\d+", (d / result.client.stderr_log).read_text())
+
+
+def test_direct_path_without_proxy(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, path_factory=None)
+
+    assert result.outcome is Outcome.PASS, result.reason
+    ready = json.loads((case_dir(layout) / "server.stdout").read_text().splitlines()[0])
+    assert f"--port={ready['port']}" in result.client.command
+    assert result.path == PathRecord(
+        proxied=False, pmtu=1500, impairments=[], split_ch1=None, actions={}
+    )
+    assert result.trace is None
+    assert not (case_dir(layout) / "trace.jsonl").exists()
 
 
 def test_result_json_round_trip(tmp_path, layout, test_pki):
@@ -157,13 +184,42 @@ def test_server_unsupported(tmp_path, layout, test_pki):
     assert result.client.stdout_log is None
 
 
-def test_client_unsupported(tmp_path, layout, test_pki):
-    result = run(tmp_path, layout, test_pki, client_flags=["--behave=exit2"], server_grace=0.5)
+def test_client_unsupported_stops_server_at_once(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, client_flags=["--behave=exit2"])
 
     assert result.outcome is Outcome.UNSUPPORTED
     assert result.client.exit_code == 2
-    # The server never got a ping and was killed after the grace period.
+    # Exit 2 decides the outcome, so the waiting server is killed without the grace period.
     assert result.server.killed and result.server.exit_code is None
+    assert result.duration_s < OK_LIMITS["server_grace"] / 2
+
+
+def test_client_usage_error_stops_server_at_once(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, client_flags=["--bogus=1"])
+
+    assert result.outcome is Outcome.ERROR
+    assert result.client.exit_code == 64
+    assert result.server.killed
+    assert result.duration_s < OK_LIMITS["server_grace"] / 2
+
+
+def test_server_unsupported_mid_handshake_stops_client_at_once(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, server_flags=["--behave=exit2-on-ping"])
+
+    assert result.outcome is Outcome.UNSUPPORTED
+    assert result.reason == "server: unsupported, found out during the handshake"
+    assert result.server.exit_code == 2
+    # The client still waits for its pong; the runner kills it instead of waiting for it.
+    assert result.client.killed and result.client.exit_code is None
+    assert result.duration_s < OK_LIMITS["server_grace"] / 2
+
+
+def test_client_failure_still_waits_for_the_server(tmp_path, layout, test_pki):
+    result = run(tmp_path, layout, test_pki, client_flags=["--behave=fail"])
+
+    assert result.outcome is Outcome.FAIL
+    # The server answered the ping and exited by itself within the grace period.
+    assert result.server.exit_code == 0 and not result.server.killed
 
 
 def test_client_hang_times_out(tmp_path, layout, test_pki):
@@ -261,17 +317,20 @@ def test_adapter_not_executable(tmp_path, layout, test_pki):
 
 
 @pytest.mark.parametrize(
-    ("scenario_id", "reason"),
+    ("scenario_id", "reason", "path_factory"),
     [
-        ("S08", "path impairments not available"),
-        ("S09", "path impairments not available"),
-        ("S10", "PSK resumption is not implemented in the runner"),
-        ("T01", "tls transport is not in the adapter contract"),
+        ("S08", "path impairments not available", None),
+        ("S09", "path impairments not available", None),
+        ("S03+split", "CH1 split needs the proxy", None),
+        ("S10", "PSK resumption is not implemented in the runner", runner.proxy_path),
+        ("T01", "tls transport is not in the adapter contract", runner.proxy_path),
     ],
 )
-def test_unrunnable_scenarios_are_errors(tmp_path, layout, test_pki, scenario_id, reason):
+def test_unrunnable_scenarios_are_errors(
+    tmp_path, layout, test_pki, scenario_id, reason, path_factory
+):
     scenario = scenarios.get(scenario_id)
-    result = run(tmp_path, layout, test_pki, scenario=scenario)
+    result = run(tmp_path, layout, test_pki, scenario=scenario, path_factory=path_factory)
 
     assert result.outcome is Outcome.ERROR
     assert result.reason == reason
@@ -360,6 +419,41 @@ def test_path_factory_routes_client_and_records_trace(tmp_path, layout, test_pki
         {"index": 1, "direction": "s2c", "payload": b"pong".hex()},
     ]
     assert result.trace == "trace.jsonl"
+
+
+@pytest.mark.parametrize("scenario_id", ["S08", "S09", "S03+split"])
+def test_impaired_and_split_scenarios_run_through_the_proxy(
+    tmp_path, layout, test_pki, scenario_id
+):
+    scenario = scenarios.get(scenario_id)
+    result = run(tmp_path, layout, test_pki, scenario=scenario)
+
+    # Plain UDP has no ClientHello, so the rules forward everything.
+    assert result.outcome is Outcome.PASS, result.reason
+    assert result.path.proxied is True
+    assert result.path.pmtu == scenario.path.pmtu
+    assert result.path.impairments == [str(i) for i in scenario.path.impairments]
+    assert result.path.split_ch1 == scenario.path.split_ch1
+    assert result.path.actions == {}
+
+
+class _Boom(Rule):
+    def on_packet(self, packet, now):
+        if packet.direction == "c2s":
+            raise ValueError("rule exploded")
+        return FORWARD
+
+
+def test_path_failure_is_error(tmp_path, layout, test_pki):
+    def factory(server, conditions):
+        return UdpProxy(server, pmtu=conditions.pmtu, rules=[_Boom()])
+
+    result = run(tmp_path, layout, test_pki, path_factory=factory, case_timeout=2)
+
+    assert result.outcome is Outcome.ERROR
+    assert result.reason == "path failed: UDP proxy thread failed"
+    assert result.path.proxied is True
+    assert result.client.killed
 
 
 def test_path_factory_refusal_is_error(tmp_path, layout, test_pki):
