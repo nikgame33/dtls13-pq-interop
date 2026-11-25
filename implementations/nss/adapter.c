@@ -1,4 +1,4 @@
-/* DTLS 1.3 interop adapter for NSS, implementing docs/shim-interface.md. */
+/* DTLS 1.3 (and TLS 1.3) interop adapter for NSS, implementing docs/shim-interface.md. */
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -47,8 +48,8 @@ enum { EXIT_OK = 0, EXIT_FAIL = 1, EXIT_UNSUPPORTED = 2, EXIT_USAGE = 64 };
 
 enum { HRR_SEEN = 1, HRR_COOKIE = 2, HRR_GROUP = 4 };
 
-enum { OPT_ROLE, OPT_VARIANT, OPT_HOST, OPT_PORT, OPT_GROUPS, OPT_MTU, OPT_CA, OPT_KEY_SHARE,
-    OPT_VALIDATE, OPT_CERT, OPT_KEY, OPT_COUNT };
+enum { OPT_ROLE, OPT_VARIANT, OPT_HOST, OPT_PORT, OPT_GROUPS, OPT_TRANSPORT, OPT_RESUME, OPT_MTU,
+    OPT_CA, OPT_KEY_SHARE, OPT_VALIDATE, OPT_CERT, OPT_KEY, OPT_COUNT };
 
 static const struct option LONGOPTS[] = {
     { "role", required_argument, NULL, OPT_ROLE },
@@ -56,6 +57,8 @@ static const struct option LONGOPTS[] = {
     { "host", required_argument, NULL, OPT_HOST },
     { "port", required_argument, NULL, OPT_PORT },
     { "groups", required_argument, NULL, OPT_GROUPS },
+    { "transport", required_argument, NULL, OPT_TRANSPORT },
+    { "resume", required_argument, NULL, OPT_RESUME },
     { "mtu", required_argument, NULL, OPT_MTU },
     { "ca", required_argument, NULL, OPT_CA },
     { "key-share", required_argument, NULL, OPT_KEY_SHARE },
@@ -67,11 +70,11 @@ static const struct option LONGOPTS[] = {
 
 static const bool CLIENT_OPT[OPT_COUNT] = {
     [OPT_ROLE] = true, [OPT_VARIANT] = true, [OPT_HOST] = true, [OPT_PORT] = true,
-    [OPT_GROUPS] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_KEY_SHARE] = true,
+    [OPT_GROUPS] = true, [OPT_TRANSPORT] = true, [OPT_RESUME] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_KEY_SHARE] = true,
 };
 static const bool SERVER_OPT[OPT_COUNT] = {
     [OPT_ROLE] = true, [OPT_VARIANT] = true, [OPT_HOST] = true, [OPT_PORT] = true,
-    [OPT_GROUPS] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_VALIDATE] = true,
+    [OPT_GROUPS] = true, [OPT_TRANSPORT] = true, [OPT_RESUME] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_VALIDATE] = true,
     [OPT_CERT] = true, [OPT_KEY] = true,
 };
 
@@ -98,6 +101,8 @@ static const struct {
 struct options {
     const char *val[OPT_COUNT];
     bool server;
+    bool tls; /* --transport=tls: TLS 1.3 over TCP */
+    bool resume; /* --resume=ticket: a second connection resumes the first */
     bool cookie;
     long mtu;
     long payload; /* largest UDP payload: mtu - IP_UDP_OVERHEAD, or 0 for --mtu=default */
@@ -123,6 +128,15 @@ static struct message g_msgs[MAX_MESSAGES];
 static CERTCertList *g_anchors;
 static struct sockaddr_storage g_peer;
 static socklen_t g_peer_len;
+static int g_conn; /* connection number for error prefixes; 0 with --resume=off */
+static PRUint8 *g_token; /* client: the latest resumption token (NewSessionTicket) */
+static unsigned g_token_len;
+
+/* TLS: unparsed record bytes and handshake bytes per direction (0 received, 1 sent). */
+static struct stream {
+    unsigned char *rec, *hs;
+    size_t rlen, hlen;
+} g_streams[2];
 
 /* SHA-256("HelloRetryRequest"), RFC 9846 section 4.2.3. */
 static const unsigned char HRR_RANDOM[32] = {
@@ -166,12 +180,20 @@ static void json_bool(bool known, bool value)
 static int finish(int code, bool handshake_done, const char *error)
 {
     SSLChannelInfo info;
-    char unknown[16];
+    char unknown[16], prefixed[320];
     const char *version = NULL, *group = NULL;
-    bool known = g_started && code != EXIT_UNSUPPORTED && code != EXIT_USAGE;
+    bool known = g_started && code != EXIT_UNSUPPORTED && code != EXIT_USAGE, resumed = false;
 
+    if (error != NULL && g_conn > 0) {
+        snprintf(prefixed, sizeof(prefixed), "connection %d: %s", g_conn, error);
+        error = prefixed;
+    }
     if (handshake_done && SSL_GetChannelInfo(g_ssl, &info, sizeof(info)) == SECSuccess) {
-        version = info.protocolVersion == SSL_LIBRARY_VERSION_TLS_1_3 ? "DTLSv1.3" : "DTLS<1.3";
+        if (info.protocolVersion == SSL_LIBRARY_VERSION_TLS_1_3)
+            version = g_opts.tls ? "TLSv1.3" : "DTLSv1.3";
+        else
+            version = g_opts.tls ? "TLS<1.3" : "DTLS<1.3";
+        resumed = info.resumed;
         snprintf(unknown, sizeof(unknown), "0x%04x", (unsigned)info.keaGroup);
         group = group_name(info.keaGroup) != NULL ? group_name(info.keaGroup) : unknown;
     }
@@ -185,6 +207,8 @@ static int finish(int code, bool handshake_done, const char *error)
     json_bool(known, g_hrr & HRR_COOKIE);
     fputs(", \"hrr_group\": ", stdout);
     json_bool(known, g_hrr & HRR_GROUP);
+    fputs(", \"resumed\": ", stdout);
+    json_bool(known, resumed);
     fputs(", \"error\": ", stdout);
     json_string(error);
     puts("}");
@@ -289,6 +313,12 @@ static void ch_extension(unsigned type, const unsigned char *data, size_t n, voi
         s->groups[s->n++] = (SSLNamedGroup)read_u16(data + off);
 }
 
+static void psk_extension(unsigned type, const unsigned char *data, size_t n, void *arg)
+{
+    (void)data, (void)n;
+    *(bool *)arg |= type == 41;
+}
+
 static bool has_share(const struct shares *s, SSLNamedGroup g)
 {
     for (unsigned i = 0; i < s->n; i++)
@@ -299,27 +329,34 @@ static bool has_share(const struct shares *s, SSLNamedGroup g)
 
 /* Contract group rule: NSS takes its first mutual group, so groups the client sent a share for
  * go first (in --groups order); without such a share NSS sends an HRR for its first group. */
+/* Offset of a ClientHello's extensions block, or len if it is malformed. */
+static size_t ch_extensions(const unsigned char *ch, size_t len)
+{
+    size_t off = 2 + 32; /* legacy_version, random */
+
+    if (off + 1 > len)
+        return len;
+    off += 1 + ch[off]; /* legacy_session_id */
+    if (off + 1 > len)
+        return len;
+    if (!g_opts.tls)
+        off += 1 + ch[off]; /* DTLS legacy_cookie */
+    if (off + 2 > len)
+        return len;
+    off += 2 + read_u16(ch + off); /* cipher_suites */
+    if (off + 1 > len)
+        return len;
+    return off + 1 + ch[off]; /* legacy_compression_methods */
+}
+
 static void order_server_groups(const unsigned char *ch, size_t len)
 {
     struct shares shares = { .n = 0 };
     SSLNamedGroup order[MAX_GROUPS];
     unsigned n = 0;
-    size_t off = 2 + 32; /* legacy_version, random */
     char list[512] = "";
 
-    if (off + 1 > len)
-        return;
-    off += 1 + ch[off]; /* legacy_session_id */
-    if (off + 1 > len)
-        return;
-    off += 1 + ch[off]; /* DTLS legacy_cookie */
-    if (off + 2 > len)
-        return;
-    off += 2 + read_u16(ch + off); /* cipher_suites */
-    if (off + 1 > len)
-        return;
-    off += 1 + ch[off]; /* legacy_compression_methods */
-    each_extension(ch, len, off, ch_extension, &shares);
+    each_extension(ch, len, ch_extensions(ch, len), ch_extension, &shares);
     for (int pass = 0; pass < 2; pass++)
         for (unsigned i = 0; i < g_opts.ngroups; i++)
             if (has_share(&shares, g_opts.groups[i]) == (pass == 0))
@@ -350,6 +387,13 @@ static void on_message(bool sent, unsigned type, const unsigned char *body, size
         return;
     }
     fprintf(stderr, "%s %s (%zu bytes)\n", dir, hs_name(type), len);
+    if (type == 1) {
+        bool psk = false;
+
+        each_extension(body, len, ch_extensions(body, len), psk_extension, &psk);
+        if (psk)
+            fprintf(stderr, "   ClientHello offers a PSK (pre_shared_key)\n");
+    }
     if (type == 1 && !sent && g_opts.server)
         order_server_groups(body, len);
 }
@@ -429,7 +473,48 @@ static void inspect(bool sent, const unsigned char *p, size_t n)
     }
 }
 
-/* NSPR layer between libssl and the UDP socket: logs, checks --mtu, feeds inspect(). */
+/* TLS: logs the records of a byte stream chunk; plaintext handshake messages go to on_message(). */
+static void inspect_stream(bool sent, const unsigned char *p, size_t n)
+{
+    struct stream *s = &g_streams[sent];
+    const char *dir = sent ? ">>" : "<<";
+    unsigned char *rec = realloc(s->rec, s->rlen + n);
+    size_t off = 0;
+
+    if (rec == NULL)
+        return;
+    s->rec = rec;
+    memcpy(s->rec + s->rlen, p, n);
+    s->rlen += n;
+    while (off + 5 <= s->rlen && off + 5 + read_u16(s->rec + off + 3) <= s->rlen) {
+        unsigned char t = s->rec[off];
+        size_t len = read_u16(s->rec + off + 3), h = 0;
+
+        if (t == 22) {
+            unsigned char *hs = realloc(s->hs, s->hlen + len);
+
+            fprintf(stderr, "%s plaintext handshake record (%zu bytes)\n", dir, len);
+            if (hs == NULL)
+                return;
+            s->hs = hs;
+            memcpy(s->hs + s->hlen, s->rec + off + 5, len);
+            s->hlen += len;
+            for (; h + 4 <= s->hlen && h + 4 + read_u24(s->hs + h + 1) <= s->hlen; h += 4 + read_u24(s->hs + h + 1))
+                on_message(sent, s->hs[h], s->hs + h + 4, read_u24(s->hs + h + 1));
+            memmove(s->hs, s->hs + h, s->hlen - h);
+            s->hlen -= h;
+        } else if (t == 23) {
+            fprintf(stderr, "%s ciphertext record (%zu bytes)\n", dir, len);
+        } else {
+            fprintf(stderr, "%s plaintext record type %u (%zu bytes)\n", dir, t, len);
+        }
+        off += 5 + len;
+    }
+    memmove(s->rec, s->rec + off, s->rlen - off);
+    s->rlen -= off;
+}
+
+/* NSPR layer between libssl and the socket: logs, checks --mtu, feeds inspect(). */
 static PRInt32 PR_CALLBACK layer_send(PRFileDesc *fd, const void *buf, PRInt32 amount,
     PRIntn flags, PRIntervalTime timeout)
 {
@@ -442,7 +527,10 @@ static PRInt32 PR_CALLBACK layer_send(PRFileDesc *fd, const void *buf, PRInt32 a
         return -1;
     }
     n = fd->lower->methods->send(fd->lower, buf, amount, flags, timeout);
-    if (n > 0) {
+    if (n > 0 && g_opts.tls) {
+        fprintf(stderr, ">> TCP (%d bytes)\n", n);
+        inspect_stream(true, buf, (size_t)n);
+    } else if (n > 0) {
         fprintf(stderr, ">> datagram (%d bytes)\n", n);
         inspect(true, buf, (size_t)n);
     }
@@ -459,7 +547,10 @@ static PRInt32 PR_CALLBACK layer_recv(PRFileDesc *fd, void *buf, PRInt32 amount,
 {
     PRInt32 n = fd->lower->methods->recv(fd->lower, buf, amount, flags, timeout);
 
-    if (n > 0) {
+    if (n > 0 && g_opts.tls) {
+        fprintf(stderr, "<< TCP (%d bytes)\n", n);
+        inspect_stream(false, buf, (size_t)n);
+    } else if (n > 0) {
         fprintf(stderr, "<< datagram (%d bytes)\n", n);
         inspect(false, buf, (size_t)n);
     }
@@ -471,7 +562,7 @@ static PRInt32 PR_CALLBACK layer_read(PRFileDesc *fd, void *buf, PRInt32 amount)
     return layer_recv(fd, buf, amount, 0, PR_INTERVAL_NO_TIMEOUT);
 }
 
-/* close_notify is sent by libssl; shutdown(2) on the UDP socket would only break late ACKs. */
+/* close_notify is sent by libssl; shutdown(2) would only break late ACKs; TCP closes on PR_Close. */
 static PRStatus PR_CALLBACK layer_shutdown(PRFileDesc *fd, PRIntn how)
 {
     (void)fd, (void)how;
@@ -708,13 +799,53 @@ static void send_close_notify(void)
         fprintf(stderr, "teardown: sending close_notify failed: %s\n", PR_ErrorToName(PR_GetError()));
 }
 
-/* Wraps a connected UDP socket in the logging layer and libssl, configured for this role. */
+/* Client: keeps the latest resumption token; NSS delivers one per NewSessionTicket. */
+static SECStatus PR_CALLBACK token_cb(PRFileDesc *fd, const PRUint8 *token, unsigned len, void *arg)
+{
+    PRUint8 *copy = malloc(len);
+
+    (void)fd, (void)arg;
+    if (copy == NULL)
+        return SECFailure;
+    memcpy(copy, token, len);
+    free(g_token);
+    g_token = copy;
+    g_token_len = len;
+    fprintf(stderr, "   resumption token (%u bytes)\n", len);
+    return SECSuccess;
+}
+
+/* Per-connection state, so the result line describes the last connection only. */
+static void reset_connection(int conn)
+{
+    g_conn = g_opts.resume ? conn : 0;
+    g_hrr = 0;
+    g_oversize = 0;
+    g_cert_error = 0;
+    for (int i = 0; i < MAX_MESSAGES; i++) {
+        free(g_msgs[i].buf);
+        free(g_msgs[i].have);
+    }
+    memset(g_msgs, 0, sizeof(g_msgs));
+    for (int i = 0; i < 2; i++) {
+        free(g_streams[i].rec);
+        free(g_streams[i].hs);
+    }
+    memset(g_streams, 0, sizeof(g_streams));
+    if (g_ssl != NULL)
+        PR_Close(g_ssl);
+    g_ssl = NULL;
+    if (g_opts.resume)
+        fprintf(stderr, "connection %d\n", conn);
+}
+
+/* Wraps a connected socket in the logging layer and libssl, configured for this role. */
 static int import_socket(int fd)
 {
     static PRIOMethods methods;
     PRSocketOptionData nonblocking = { .option = PR_SockOpt_Nonblocking, .value.non_blocking = PR_TRUE };
     SSLVersionRange range = { SSL_LIBRARY_VERSION_TLS_1_3, SSL_LIBRARY_VERSION_TLS_1_3 };
-    PRFileDesc *udp = PR_ImportUDPSocket(fd), *layer;
+    PRFileDesc *sock = g_opts.tls ? PR_ImportTCPSocket(fd) : PR_ImportUDPSocket(fd), *layer;
 
     methods = *PR_GetDefaultIOMethods();
     methods.send = layer_send;
@@ -722,35 +853,36 @@ static int import_socket(int fd)
     methods.recv = layer_recv;
     methods.read = layer_read;
     methods.shutdown = layer_shutdown;
-    if (udp == NULL || PR_SetSocketOption(udp, &nonblocking) != PR_SUCCESS)
-        return fail_nss("importing the UDP socket");
+    if (sock == NULL || PR_SetSocketOption(sock, &nonblocking) != PR_SUCCESS)
+        return fail_nss("importing the socket");
     layer = PR_CreateIOLayerStub(PR_GetUniqueIdentity("dtls-adapter"), &methods);
-    if (layer == NULL || PR_PushIOLayer(udp, PR_TOP_IO_LAYER, layer) != PR_SUCCESS)
+    if (layer == NULL || PR_PushIOLayer(sock, PR_TOP_IO_LAYER, layer) != PR_SUCCESS)
         return fail_nss("pushing the IO layer");
-    if ((g_ssl = DTLS_ImportFD(NULL, udp)) == NULL)
-        return fail_nss("DTLS_ImportFD");
+    if ((g_ssl = g_opts.tls ? SSL_ImportFD(NULL, sock) : DTLS_ImportFD(NULL, sock)) == NULL)
+        return fail_nss(g_opts.tls ? "SSL_ImportFD" : "DTLS_ImportFD");
+    /* NSS servers send no NewSessionTicket unless enabled (sslsock.c ssl_defaults). */
     if (SSL_VersionRangeSet(g_ssl, &range) != SECSuccess
         || SSL_NamedGroupConfig(g_ssl, g_opts.groups, g_opts.ngroups) != SECSuccess
+        || (g_opts.server && SSL_OptionSet(g_ssl, SSL_ENABLE_SESSION_TICKETS, PR_TRUE) != SECSuccess)
         || SSL_AlertReceivedCallback(g_ssl, alert_cb, NULL) != SECSuccess
         || SSL_AlertSentCallback(g_ssl, alert_cb, (void *)1) != SECSuccess
         || SSL_ResetHandshake(g_ssl, g_opts.server) != SECSuccess)
-        return fail_nss("configuring the DTLS socket");
+        return fail_nss("configuring the socket");
     return EXIT_OK;
 }
 
-static int run_client(void)
+static int connect_socket(void)
 {
-    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM }, *res, *ai;
-    const char *share = g_opts.val[OPT_KEY_SHARE];
-    int fd = -1, rc, n;
-    char buf[64];
+    int type = g_opts.tls ? SOCK_STREAM : SOCK_DGRAM;
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = type }, *res, *ai;
+    struct sockaddr_storage local;
+    socklen_t len = sizeof(local);
+    int fd = -1;
 
-    if ((rc = load_ca()) != EXIT_OK)
-        return rc;
     if (getaddrinfo(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], &hints, &res) != 0)
         return fail_msg(EXIT_FAIL, "resolving --host %s", g_opts.val[OPT_HOST]);
     for (ai = res; ai != NULL && fd < 0; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, SOCK_DGRAM, 0);
+        fd = socket(ai->ai_family, type, 0);
         if (fd >= 0 && connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
             close(fd);
             fd = -1;
@@ -758,8 +890,23 @@ static int run_client(void)
     }
     freeaddrinfo(res);
     if (fd < 0)
-        return fail_msg(EXIT_FAIL, "connecting UDP socket: %s", strerror(errno));
-    if ((rc = import_socket(fd)) != EXIT_OK)
+        return fail_msg(EXIT_FAIL, "connecting %s socket: %s", g_opts.tls ? "TCP" : "UDP", strerror(errno));
+    if (getsockname(fd, (struct sockaddr *)&local, &len) == 0)
+        fprintf(stderr, "socket: local port %u\n",
+            ntohs(local.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&local)->sin6_port
+                                              : ((struct sockaddr_in *)&local)->sin_port));
+    return import_socket(fd);
+}
+
+/* One client lifecycle; connection 2 offers the token from connection 1. */
+static int client_connection(int conn)
+{
+    const char *share = g_opts.val[OPT_KEY_SHARE];
+    int rc, n;
+    char buf[64];
+
+    reset_connection(conn);
+    if ((rc = connect_socket()) != EXIT_OK)
         return rc;
     /* NSS puts one share for its first group into CH1, plus one per SSL_SendAdditionalKeyShares. */
     if (strcmp(share, "default") != 0 && SSL_SendAdditionalKeyShares(g_ssl, 0) != SECSuccess)
@@ -767,6 +914,10 @@ static int run_client(void)
     if (SSL_SetURL(g_ssl, SERVER_NAME) != SECSuccess
         || SSL_AuthCertificateHook(g_ssl, auth_cert_cb, CERT_GetDefaultCertDB()) != SECSuccess)
         return fail_nss("configuring server authentication");
+    if (g_opts.resume && SSL_SetResumptionTokenCallback(g_ssl, token_cb, NULL) != SECSuccess)
+        return fail_nss("SSL_SetResumptionTokenCallback");
+    if (conn == 2 && SSL_SetResumptionToken(g_ssl, g_token, g_token_len) != SECSuccess)
+        return fail_nss("SSL_SetResumptionToken");
 
     if ((rc = handshake()) != EXIT_OK)
         return rc;
@@ -777,57 +928,86 @@ static int run_client(void)
         return n == -2 ? fail_msg(EXIT_FAIL, "reading pong: timeout") : fail_nss("reading pong");
     if (n != 4 || memcmp(buf, "pong", 4) != 0)
         return fail_msg(EXIT_FAIL, "unexpected echo (%d bytes)", n);
+    if (conn == 1 && g_opts.resume && g_token == NULL) {
+        fprintf(stderr, "error: no session ticket received\n");
+        return finish(EXIT_FAIL, true, "no session ticket received");
+    }
 
     /* The verdict is final after pong; teardown problems are only logged. */
     send_close_notify();
     await_close_notify();
+    return EXIT_OK;
+}
+
+static int run_client(void)
+{
+    int rc;
+
+    if ((rc = load_ca()) != EXIT_OK)
+        return rc;
+    for (int conn = 1; conn <= (g_opts.resume ? 2 : 1); conn++)
+        if ((rc = client_connection(conn)) != EXIT_OK)
+            return rc;
     return finish(EXIT_OK, true, NULL);
 }
 
-static int bind_server_socket(void)
+/* A UDP or listening TCP socket on --host/--port (or on *addr, the port of the first one). */
+static int server_socket(struct sockaddr_storage *addr, socklen_t *len)
 {
-    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM, .ai_flags = AI_PASSIVE };
+    int type = g_opts.tls ? SOCK_STREAM : SOCK_DGRAM, one = 1, fd;
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = type, .ai_flags = AI_PASSIVE };
     struct addrinfo *res;
-    struct sockaddr_storage addr;
-    socklen_t len = sizeof(addr);
-    int fd;
 
-    if (getaddrinfo(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], &hints, &res) != 0)
-        return -1;
-    fd = socket(res->ai_family, SOCK_DGRAM, 0);
-    if (fd >= 0 && bind(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    if (*len == 0) {
+        if (getaddrinfo(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], &hints, &res) != 0)
+            return -1;
+        memcpy(addr, res->ai_addr, res->ai_addrlen);
+        *len = res->ai_addrlen;
+        freeaddrinfo(res);
+    }
+    fd = socket(addr->ss_family, type, 0);
+    if (fd >= 0 && (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0
+                       || bind(fd, (struct sockaddr *)addr, *len) != 0
+                       || (g_opts.tls && listen(fd, 4) != 0)
+                       || getsockname(fd, (struct sockaddr *)addr, len) != 0)) {
         close(fd);
         fd = -1;
     }
-    freeaddrinfo(res);
-    if (fd < 0 || getsockname(fd, (struct sockaddr *)&addr, &len) != 0)
-        return -1;
-    printf("{\"event\": \"ready\", \"port\": %u}\n",
-        ntohs(addr.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&addr)->sin6_port
-                                         : ((struct sockaddr_in *)&addr)->sin_port));
-    fflush(stdout);
     return fd;
 }
 
-static int run_server(void)
+/* DTLS: libssl serves one peer per socket, so the socket is connected to the first datagram's
+ * sender; datagrams that connection 1's peer still sends are dropped. */
+static int accept_datagram_peer(int fd, const struct sockaddr_storage *prev, socklen_t prev_len)
 {
-    CERTCertificate *cert = NULL;
-    SECKEYPrivateKey *key = NULL;
     unsigned char byte;
-    int fd, rc, n;
+
+    for (;;) {
+        g_peer_len = sizeof(g_peer);
+        if (recvfrom(fd, &byte, 1, MSG_PEEK, (struct sockaddr *)&g_peer, &g_peer_len) < 0)
+            return fail_msg(EXIT_FAIL, "waiting for the first datagram: %s", strerror(errno));
+        if (prev_len == 0 || g_peer_len != prev_len || memcmp(&g_peer, prev, prev_len) != 0)
+            break;
+        fprintf(stderr, "<< dropping a late datagram from connection 1's peer\n");
+        recv(fd, &byte, 1, 0);
+    }
+    if (connect(fd, (struct sockaddr *)&g_peer, g_peer_len) != 0)
+        return fail_msg(EXIT_FAIL, "connecting to the peer: %s", strerror(errno));
+    return EXIT_OK;
+}
+
+/* One server lifecycle on fd (DTLS: the bound socket; TLS: the listening socket). */
+static int server_connection(int conn, int fd, CERTCertificate *cert, SECKEYPrivateKey *key)
+{
+    int rc, n;
     char buf[64];
 
-    if ((rc = load_server_credentials(&cert, &key)) != EXIT_OK)
-        return rc;
-    if (SSL_ConfigServerSessionIDCache(0, 0, 0, NULL) != SECSuccess)
-        return fail_nss("SSL_ConfigServerSessionIDCache");
-    if ((fd = bind_server_socket()) < 0)
-        return fail_msg(EXIT_FAIL, "binding UDP socket: %s", strerror(errno));
-    /* libssl serves one peer per socket: connect it to the sender of the first datagram. */
-    g_peer_len = sizeof(g_peer);
-    if (recvfrom(fd, &byte, 1, MSG_PEEK, (struct sockaddr *)&g_peer, &g_peer_len) < 0
-        || connect(fd, (struct sockaddr *)&g_peer, g_peer_len) != 0)
-        return fail_msg(EXIT_FAIL, "waiting for the first datagram: %s", strerror(errno));
+    reset_connection(conn);
+    if (g_opts.tls) {
+        g_peer_len = sizeof(g_peer);
+        if ((fd = accept(fd, (struct sockaddr *)&g_peer, &g_peer_len)) < 0)
+            return fail_msg(EXIT_FAIL, "accepting a TCP connection: %s", strerror(errno));
+    }
     if ((rc = import_socket(fd)) != EXIT_OK)
         return rc;
     if (SSL_ConfigServerCert(g_ssl, cert, key, NULL, 0) != SECSuccess)
@@ -846,6 +1026,44 @@ static int run_server(void)
         return fail_nss("writing pong");
     await_close_notify();
     send_close_notify();
+    return EXIT_OK;
+}
+
+static int run_server(void)
+{
+    CERTCertificate *cert = NULL;
+    SECKEYPrivateKey *key = NULL;
+    struct sockaddr_storage addr, prev;
+    socklen_t len = 0, prev_len = 0;
+    int fd, next = -1, rc;
+
+    if ((rc = load_server_credentials(&cert, &key)) != EXIT_OK)
+        return rc;
+    /* Server-side session state lives in this process; tickets are encrypted with its keys. */
+    if (SSL_ConfigServerSessionIDCache(0, 0, 0, NULL) != SECSuccess)
+        return fail_nss("SSL_ConfigServerSessionIDCache");
+    if ((fd = server_socket(&addr, &len)) < 0)
+        return fail_msg(EXIT_FAIL, "binding the server socket: %s", strerror(errno));
+    printf("{\"event\": \"ready\", \"port\": %u}\n",
+        ntohs(addr.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&addr)->sin6_port
+                                         : ((struct sockaddr_in *)&addr)->sin_port));
+    fflush(stdout);
+    for (int conn = 1; conn <= (g_opts.resume ? 2 : 1); conn++) {
+        if (!g_opts.tls) {
+            if ((rc = accept_datagram_peer(fd, &prev, prev_len)) != EXIT_OK)
+                return rc;
+            /* Connection 2 comes from a new port: a second unconnected socket on the same port
+             * gets it, while connection 1's peer stays with the connected one. */
+            if (conn == 1 && g_opts.resume && (next = server_socket(&addr, &len)) < 0)
+                return fail_msg(EXIT_FAIL, "binding the second UDP socket: %s", strerror(errno));
+            prev = g_peer;
+            prev_len = g_peer_len;
+        }
+        if ((rc = server_connection(conn, fd, cert, key)) != EXIT_OK)
+            return rc;
+        if (!g_opts.tls)
+            fd = next;
+    }
     return finish(EXIT_OK, true, NULL);
 }
 
@@ -855,11 +1073,12 @@ static int usage(const char *fmt, const char *arg)
 
     snprintf(msg, sizeof(msg), fmt, arg);
     fprintf(stderr,
-        "usage: run --role=client --variant=default --host=HOST --port=PORT\n"
-        "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --key-share=GROUP|empty|default\n"
-        "       run --role=server --variant=default --host=HOST --port=PORT\n"
-        "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --validate=off|cookie\n"
-        "           --cert=FILE --key=FILE\n");
+        "usage: run --role=client --variant=default --host=HOST --port=PORT --groups=G1[,G2...]\n"
+        "           --transport=dtls|tls --resume=off|ticket --mtu=N|default --ca=FILE\n"
+        "           --key-share=GROUP|empty|default\n"
+        "       run --role=server --variant=default --host=HOST --port=PORT --groups=G1[,G2...]\n"
+        "           --transport=dtls|tls --resume=off|ticket --mtu=N|default --ca=FILE\n"
+        "           --validate=off|cookie --cert=FILE --key=FILE\n");
     return fail_msg(EXIT_USAGE, "usage: %s", msg);
 }
 
@@ -940,6 +1159,16 @@ static int parse_options(int argc, char **argv)
         return usage("malformed --port=%s", g_opts.val[OPT_PORT]);
     if (!valid_groups(g_opts.val[OPT_GROUPS]))
         return usage("malformed --groups=%s", g_opts.val[OPT_GROUPS]);
+    v = g_opts.val[OPT_TRANSPORT];
+    if (strcmp(v, "dtls") != 0 && strcmp(v, "tls") != 0)
+        return usage("--transport must be dtls or tls", NULL);
+    g_opts.tls = strcmp(v, "tls") == 0;
+    v = g_opts.val[OPT_RESUME];
+    if (strcmp(v, "off") != 0 && strcmp(v, "ticket") != 0)
+        return usage("--resume must be off or ticket", NULL);
+    g_opts.resume = strcmp(v, "ticket") == 0;
+    if (g_opts.tls && strcmp(g_opts.val[OPT_MTU], "default") != 0)
+        return usage("--mtu=%s: TLS over TCP takes only --mtu=default", g_opts.val[OPT_MTU]);
     if (strcmp(g_opts.val[OPT_MTU], "default") != 0) {
         errno = 0;
         g_opts.mtu = strtol(g_opts.val[OPT_MTU], &end, 10);
@@ -1012,9 +1241,11 @@ int main(int argc, char **argv)
     /* No database: nothing outside the pinned build and these flags affects the run. */
     if (NSS_NoDB_Init(NULL) != SECSuccess)
         return fail_nss("NSS_NoDB_Init");
-    fprintf(stderr, "NSS %s, NSPR %s, role=%s variant=%s groups=%s mtu=%s key-share=%s validate=%s\n",
+    g_conn = g_opts.resume ? 1 : 0;
+    fprintf(stderr, "NSS %s, NSPR %s, role=%s variant=%s transport=%s resume=%s groups=%s mtu=%s "
+        "key-share=%s validate=%s\n",
         NSS_GetVersion(), PR_GetVersion(), g_opts.val[OPT_ROLE], g_opts.val[OPT_VARIANT],
-        g_opts.val[OPT_GROUPS], g_opts.val[OPT_MTU],
+        g_opts.val[OPT_TRANSPORT], g_opts.val[OPT_RESUME], g_opts.val[OPT_GROUPS], g_opts.val[OPT_MTU],
         g_opts.server ? "-" : g_opts.val[OPT_KEY_SHARE],
         g_opts.server ? g_opts.val[OPT_VALIDATE] : "-");
     if ((rc = check_supported()) != EXIT_OK)
