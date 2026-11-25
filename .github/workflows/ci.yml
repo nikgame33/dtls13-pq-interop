@@ -69,3 +69,7 @@ jobs:
         env:
           DTLS_INTEROP_REQUIRE: ${{ matrix.name }}
         run: uv run pytest tests/impl/test_${{ matrix.name }}.py
+      - name: Conformance suite
+        env:
+          DTLS_INTEROP_REQUIRE: ${{ matrix.name }}
+        run: uv run pytest tests/conformance

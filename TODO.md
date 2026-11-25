@@ -22,7 +22,7 @@ Mark done with `[x]` and add the commit or PR reference.
 - [x] Result schema (JSON per run) and a results directory layout keyed by date, implementation versions and scenario (PR #3)
 - [x] Test PKI generation (ECDSA P-256 CA + leaf), fresh per test session
 
-- [ ] Conformance suite `tests/conformance/`: every rule of docs/shim-interface.md against every built implementation and variant (ADR 0002)
+- [x] Conformance suite `tests/conformance/`: every rule of docs/shim-interface.md against every built implementation and variant (ADR 0002) (PR #9)
 
 ## Phase 2: Implementations
 

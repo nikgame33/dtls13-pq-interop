@@ -24,7 +24,7 @@ The listener is what OpenSSL documents for DTLS 1.3 servers.
 
 ## Option mapping
 
-Every option of the role is required, accepted as `--opt=value` or `--opt value`.
+Every option of the role is required, accepted as `--opt=value` or `--opt value` with the exact name (no abbreviations).
 A missing, unknown, repeated or other-role option and a malformed value exit 64.
 
 | Option | OpenSSL mapping |

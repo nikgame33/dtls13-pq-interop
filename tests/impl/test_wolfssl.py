@@ -179,8 +179,8 @@ def test_x25519_self_interop(run_pair, validate: str) -> None:
 @pytest.mark.parametrize("mtu", [1500, 1280])
 @pytest.mark.parametrize("validate", ["off", "cookie"])
 def test_x25519mlkem768_self_interop(run_pair, mtu: int, validate: str) -> None:
-    o = run_pair(*_args("X25519MLKEM768", mtu, validate))
-    # At MTU 1280 CH1 does not fit, so the client sends an empty key_share (xfail test below).
+    o = run_pair(*_args("X25519MLKEM768", mtu, validate, key_share="default"))
+    # At MTU 1280 CH1 with the share does not fit, so the client sends an empty key_share instead.
     hrr = validate == "cookie" or mtu == 1280
     _assert_ok(
         o,
@@ -198,19 +198,19 @@ def test_secp256r1mlkem768_self_interop(run_pair, validate: str) -> None:
     _assert_ok(o, "SecP256r1MLKEM768", hrr=validate == "cookie", cookie=True, max_datagram=1452)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="wolfSSL 5.9.4 client (WOLFSSL_DTLS_CH_FRAG) replaces the requested key share with an "
-    "empty key_share when CH1 exceeds the MTU, forcing an HRR instead of fragmenting CH1 "
-    "(src/tls13.c, 'Sending empty key share so we don't fragment CH1')",
-)
-def test_client_sends_full_pq_share_in_fragmented_ch1(run_pair) -> None:
-    o = run_pair(*_args("X25519MLKEM768", 1280, "off"))
-    _assert_ok(o, "X25519MLKEM768", hrr=False, max_datagram=1232)
+@pytest.mark.parametrize("mtu", [1280, "default"])
+def test_requested_share_that_does_not_fit_ch1_is_unsupported(run_pair, mtu) -> None:
+    """wolfSSL (WOLFSSL_DTLS_CH_FRAG) would replace the share with an empty key_share instead of
+    fragmenting CH1 (src/tls13.c), so the adapter exits 2 before sending anything."""
+    o = run_pair(*_args("X25519MLKEM768", mtu, "off"), timeout=HANG_TIMEOUT)
+    assert o.client.rc == EXIT_UNSUPPORTED, o.client.stderr
+    assert o.client.result is not None and "empty key_share" in o.client.result["error"]
+    assert " tx " not in o.client.stderr, o.client.stderr
+    assert o.server.rc is None, "the server must not have received a ClientHello"
 
 
 def test_default_mtu_is_1400_and_too_small_for_x25519mlkem768_ch1(run_pair) -> None:
-    o = run_pair(*_args("X25519MLKEM768", "default", "off"))
+    o = run_pair(*_args("X25519MLKEM768", "default", "off", key_share="default"))
     # WOLFSSL_MAX_MTU is 1400 and the X25519MLKEM768 CH1 is 1403 bytes, so the share is dropped.
     _assert_ok(o, "X25519MLKEM768", hrr=True, hrr_group=True, max_datagram=1400)
     assert max(_tx_sizes(o.client.stderr)) == 1400, o.client.stderr

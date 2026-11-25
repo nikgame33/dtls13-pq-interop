@@ -37,6 +37,7 @@ Library defaults that matter for deployment are selected explicitly with the val
 ### HRR reasons
 
 The result reports `hrr_cookie` and `hrr_group` next to `hrr`, because an HRR sent only for address validation and one sent for a missing key share are different findings.
+`--validate=off` rules out the first kind only: some libraries (NSS) put a cookie into every HRR, so a group HRR may carry one, and `hrr_cookie` must report it as seen on the wire.
 
 ### Teardown
 
