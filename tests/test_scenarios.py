@@ -40,10 +40,8 @@ def test_scenario_is_consistent(scenario):
     assert client.key_share == EMPTY_KEY_SHARE or client.key_share in client.groups
     if scenario.transport is Transport.TLS:
         assert client.mtu == server.mtu == scenarios.DEFAULT
-    elif scenario.path.split_ch1 is None:
-        assert client.mtu == server.mtu == scenario.path.pmtu
     else:
-        assert client.mtu == scenario.path.pmtu
+        assert client.mtu == server.mtu == scenario.path.pmtu
     if scenario.expected.group is not None:
         assert scenario.expected.group in set(client.groups) & set(server.groups)
     exp = scenario.expected
