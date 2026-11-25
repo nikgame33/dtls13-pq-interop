@@ -108,20 +108,15 @@ def test_wolfssl_client_through_split_rows_to_openssl(matrix):
 
 
 def test_wolfssl_client_never_fragments_ch1_in_base_rows(matrix):
-    # wolfSSL 5.9.4 sends an empty key_share instead of fragmenting CH1 (src/tls13.c); since
-    # PR #9 the adapter exits 2 instead. TODO: keep only the unsupported branch once #9 is merged.
+    # wolfSSL 5.9.4 would send an empty key_share instead of fragmenting CH1 (src/tls13.c),
+    # so the adapter refuses the requested share with exit 2 before sending anything.
     cases, _ = matrix(["S03"], ["wolfssl"], ["openssl"])
 
     [case] = cases.values()
     assert case.path.actions == {}
-    if case.outcome is Outcome.UNSUPPORTED:
-        assert "sends an empty key_share instead of fragmenting CH1" in case.reason
-        assert case.ch1_size is None and case.duration_s < 2.0
-        return
-    assert case.outcome is Outcome.FAIL
-    assert "client sent CH1 unfragmented, expected fragmented" in case.reason
-    assert "client reported hrr=True, expected False" in case.reason
-    assert case.ch1_fragments == 1 and case.ch1_size < 300
+    assert case.outcome is Outcome.UNSUPPORTED, case.reason
+    assert "sends an empty key_share instead of fragmenting CH1" in case.reason
+    assert case.ch1_size is None and case.duration_s < 2.0
 
 
 def test_wolfssl_server_and_split_ch1(matrix):
