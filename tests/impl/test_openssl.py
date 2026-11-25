@@ -1,4 +1,7 @@
-"""OpenSSL adapter self-interop on loopback, without the proxy (real builds, UDP/TCP sockets)."""
+"""OpenSSL adapter self-interop on loopback (real builds, UDP/TCP sockets).
+
+The proxy is used only where a test needs a path event.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ from pathlib import Path
 import pytest
 
 from dtls_interop import pki
+from dtls_interop.proxy import DropOnce, UdpProxy
+from dtls_interop.records import HRR_RANDOM, HS_SERVER_HELLO, parse_datagram
 
 TIMEOUT = 20.0
 HOST = "127.0.0.1"
@@ -553,3 +558,36 @@ def test_resume_errors_name_the_connection(listener: Adapters) -> None:
     run = listener.run(listener.args("client", 1, resume="ticket", groups="MLKEM512X25519"))
     _assert_no_handshake(run, 2, "MLKEM512X25519")
     assert run.result["error"].startswith("connection 1: "), run.result
+
+
+def _server_hellos(payload: bytes) -> list:
+    """ServerHello fragments other than an HRR in a datagram."""
+    frags = parse_datagram(payload).handshake_fragments()
+    return [f for f in frags if f.msg_type == HS_SERVER_HELLO and f.body[2:34] != HRR_RANDOM]
+
+
+@pytest.mark.parametrize("validate", ["off", "cookie"])
+def test_client_waits_after_the_server_hello_datagram_is_lost(
+    adapters: Adapters, validate: str
+) -> None:
+    """S03/S04 at 1280 with the ServerHello datagram lost once, the server's next one not.
+
+    OpenSSL buffers the epoch-2 records and its blocking SSL_connect returns SSL_ERROR_WANT_READ
+    (implementations/openssl/README.md); the client must wait for the retransmission.
+    """
+    opts = {"groups": MLKEM, "mtu": "1280"}
+    srv = adapters.start_server(**opts, validate=validate)
+    lost = DropOnce(lambda p: p.direction == "s2c" and bool(_server_hellos(p.payload)), "lost SH")
+    with UdpProxy((HOST, srv.port), pmtu=1280, rules=[lost]) as proxy:
+        cli = adapters.run(adapters.args("client", proxy.address[1], **opts, key_share=MLKEM))
+        trace = proxy.trace
+    cookie = validate == "cookie"
+    _assert_ok(cli, MLKEM, hrr=cookie, cookie=cookie)
+    _assert_ok(srv.finish(), MLKEM, hrr=cookie, cookie=cookie)
+    # Only after an HRR does OpenSSL ask for the retry; each retry waits for a datagram or timer.
+    retries = cli.stderr.count("retry after SSL_get_error=2")
+    assert (1 <= retries <= 3) if cookie else retries == 0, cli.stderr
+    dropped = [d.index for d in trace if d.action == "dropped"]
+    after = [d for d in trace if d.direction == "s2c" and d.index > dropped[0]]
+    # The next server datagram carries only epoch-2 records, which the client must buffer.
+    assert len(dropped) == 1 and after and not _server_hellos(after[0].payload), trace

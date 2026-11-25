@@ -408,6 +408,71 @@ static bool wait_readable(SSL *ssl, int fd, long ms)
     }
 }
 
+/* Waits for fd (fd < 0: a listener connection) in the direction err asks for, at most until
+ * the DTLS timer expires, then lets the library retransmit; false if waiting failed. */
+static bool wait_retry(SSL *ssl, int fd, int err)
+{
+    bool want_write = err == SSL_ERROR_WANT_WRITE;
+    struct timeval tv;
+    int infinite = 1;
+
+    if (!SSL_get_event_timeout(ssl, &tv, &infinite))
+        return false;
+    if (fd >= 0) {
+        struct pollfd p = { .fd = fd, .events = want_write ? POLLOUT : POLLIN };
+        long ms = tv.tv_sec * 1000 + (tv.tv_usec + 999) / 1000;
+
+        if (poll(&p, 1, infinite ? -1 : (int)ms) < 0 && errno != EINTR)
+            return false;
+    } else {
+        SSL_POLL_ITEM item = { .desc = SSL_as_poll_descriptor(ssl),
+            .events = want_write ? SSL_POLL_EVENT_W : SSL_POLL_EVENT_R };
+        size_t ready = 0;
+
+        if (!SSL_poll(&item, 1, sizeof(item), infinite ? NULL : &tv, 0, &ready))
+            return false;
+    }
+    return SSL_handle_events(ssl) == 1;
+}
+
+enum io_op { IO_CONNECT, IO_ACCEPT, IO_READ, IO_WRITE, IO_SHUTDOWN };
+
+/* A blocking call that retries SSL_ERROR_WANT_READ/WRITE, which OpenSSL 4.1.0 returns even on
+ * blocking sockets (README.md); SSL_shutdown retries only WANT_WRITE, its reader is below. */
+static int ssl_io(SSL *ssl, int fd, enum io_op op, const void *buf, size_t len, size_t *n)
+{
+    for (;;) {
+        int ret, err;
+
+        switch (op) {
+        case IO_CONNECT:
+            ret = SSL_connect(ssl);
+            break;
+        case IO_ACCEPT:
+            ret = SSL_accept(ssl);
+            break;
+        case IO_READ:
+            ret = SSL_read_ex(ssl, (void *)buf, len, n);
+            break;
+        case IO_WRITE:
+            ret = SSL_write_ex(ssl, buf, len, n);
+            break;
+        default:
+            ret = SSL_shutdown(ssl);
+            if (ret == 0)
+                return ret;
+        }
+        if (ret > 0)
+            return ret;
+        err = SSL_get_error(ssl, ret);
+        if (!(err == SSL_ERROR_WANT_WRITE || (err == SSL_ERROR_WANT_READ && op != IO_SHUTDOWN)))
+            return ret;
+        fprintf(stderr, "retry after SSL_get_error=%d\n", err);
+        if (!wait_retry(ssl, fd, err))
+            return ret;
+    }
+}
+
 /* Waits up to TEARDOWN_MS for the peer's close_notify. After our own close_notify DTLS drops
  * other records, so SSL_shutdown is the reader; before it, SSL_read is. Errors only go to stderr. */
 static void await_close_notify(SSL *ssl, int fd, bool sent_ours)
@@ -502,13 +567,13 @@ static int client_connection(SSL_CTX *ctx, int fd, SSL_SESSION *offer, SSL_SESSI
     if (offer != NULL && !SSL_set_session(ssl, offer))
         return fail_ssl(ssl, 0, "SSL_set_session");
 
-    if ((ret = SSL_connect(ssl)) != 1)
+    if ((ret = ssl_io(ssl, fd, IO_CONNECT, NULL, 0, NULL)) != 1)
         return fail_ssl(ssl, ret, "handshake");
     fprintf(stderr, "handshake done: %s %s resumed=%d\n", SSL_get_version(ssl),
         SSL_get0_group_name(ssl), SSL_session_reused(ssl));
-    if ((ret = SSL_write_ex(ssl, "ping", 4, &n)) != 1)
+    if ((ret = ssl_io(ssl, fd, IO_WRITE, "ping", 4, &n)) != 1)
         return fail_ssl(ssl, ret, "writing ping");
-    if ((ret = SSL_read_ex(ssl, buf, sizeof(buf), &n)) != 1)
+    if ((ret = ssl_io(ssl, fd, IO_READ, buf, sizeof(buf), &n)) != 1)
         return fail_ssl(ssl, ret, "reading pong");
     if (n != 4 || memcmp(buf, "pong", 4) != 0)
         return fail_msg(EXIT_FAIL, ssl, "unexpected echo (%zu bytes)", n);
@@ -523,7 +588,7 @@ static int client_connection(SSL_CTX *ctx, int fd, SSL_SESSION *offer, SSL_SESSI
     }
 
     /* The verdict is final after pong; teardown problems are only logged. */
-    if (SSL_shutdown(ssl) < 0)
+    if (ssl_io(ssl, fd, IO_SHUTDOWN, NULL, 0, NULL) < 0)
         fprintf(stderr, "teardown: sending close_notify failed\n");
     else
         await_close_notify(ssl, fd, true);
@@ -720,19 +785,19 @@ static int server_connection(SSL_CTX *ctx, struct server *srv, SSL **out)
         return fail_ssl(NULL, 0, "accepting a connection");
     if (g_opts.tls && g_opts.cookie && (ret = tls_stateless(conn)) != 1)
         return fail_ssl(conn, ret, ret == 0 ? "stateless HRR: cookie not echoed" : "stateless HRR");
-    if ((ret = SSL_accept(conn)) != 1)
+    if ((ret = ssl_io(conn, fd, IO_ACCEPT, NULL, 0, NULL)) != 1)
         return fail_ssl(conn, ret, "handshake");
     fprintf(stderr, "handshake done: %s %s resumed=%d\n", SSL_get_version(conn),
         SSL_get0_group_name(conn), SSL_session_reused(conn));
 
-    if ((ret = SSL_read_ex(conn, buf, sizeof(buf), &n)) != 1)
+    if ((ret = ssl_io(conn, fd, IO_READ, buf, sizeof(buf), &n)) != 1)
         return fail_ssl(conn, ret, "reading ping");
     if (n != 4 || memcmp(buf, "ping", 4) != 0)
         return fail_msg(EXIT_FAIL, conn, "unexpected message (%zu bytes)", n);
-    if ((ret = SSL_write_ex(conn, "pong", 4, &n)) != 1)
+    if ((ret = ssl_io(conn, fd, IO_WRITE, "pong", 4, &n)) != 1)
         return fail_ssl(conn, ret, "writing pong");
     await_close_notify(conn, fd, false);
-    if (SSL_shutdown(conn) < 0)
+    if (ssl_io(conn, fd, IO_SHUTDOWN, NULL, 0, NULL) < 0)
         fprintf(stderr, "teardown: sending close_notify failed\n");
     ERR_clear_error();
     return EXIT_OK;
