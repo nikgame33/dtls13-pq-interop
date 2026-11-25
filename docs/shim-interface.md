@@ -20,6 +20,7 @@ Adapter tests for an implementation live in `tests/impl/test_<name>.py` and obta
 Locally they skip when the implementation is not built.
 CI runs them per implementation with `DTLS_INTEROP_REQUIRE=<name>`, which turns a missing build into a failure.
 The conformance suite in `tests/conformance/` checks every rule in this document against every built implementation and variant.
+It discovers implementations and variants itself, so a new adapter needs no change to the suite; CI runs it in each implementation's job.
 
 ## Run
 
@@ -38,6 +39,7 @@ run --role=client|server
 Every option listed for a role is required; there are no implicit defaults.
 The value `default` means "do not configure this, let the library decide", so library defaults are measured explicitly.
 A missing, unknown, repeated or other-role option, or a malformed value, is a usage error (exit 64).
+Option names match exactly, so an abbreviation such as `--group` is an unknown option, and an empty value is malformed.
 A `--key-share` group that is not in `--groups` counts as malformed.
 The runner passes every option as `--opt=value`; adapters must accept that form and should also accept `--opt value`.
 
@@ -60,6 +62,11 @@ A server selects the group as follows:
 3. Otherwise fail the handshake.
 
 An acceptable key share never triggers an HRR just to get a group the server ranks higher.
+
+### Address validation
+
+`--validate=cookie` makes the server send an HRR with a cookie to a new peer before it continues the handshake.
+With `--validate=off` the server never sends an HRR whose only purpose is a cookie; an HRR needed for group selection may still carry a cookie the library always adds (e.g. for a stateless HRR), and `hrr_cookie` reports it.
 
 ### Key share
 

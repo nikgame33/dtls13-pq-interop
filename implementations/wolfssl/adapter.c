@@ -6,7 +6,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <getopt.h>
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
@@ -62,6 +61,9 @@ static const unsigned char HRR_RANDOM[32] = {
 };
 
 static volatile sig_atomic_t g_hrr, g_hrr_cookie, g_hrr_group;
+/* Client --key-share=GROUP: its code point, and whether wolfSSL tried to send another CH1 share. */
+static unsigned g_want_share;
+static int g_share_replaced;
 /* HRR fields are unknown (null) until the handshake has started, e.g. on usage errors. */
 static volatile sig_atomic_t g_handshake_started;
 static int g_is_client;
@@ -257,6 +259,57 @@ static void inspect_datagram(const char *dir, const unsigned char *b, int n, int
     fputc('\n', stderr);
 }
 
+/* Offset of an extension's data in a (first fragment of a) ClientHello body, or 0 if absent. */
+static unsigned client_hello_ext(const unsigned char *p, unsigned n, unsigned type, unsigned *len)
+{
+    unsigned i = 34, end;
+    if (i + 1 > n)
+        return 0;
+    i += 1 + p[i]; /* legacy_session_id */
+    if (i + 1 > n)
+        return 0;
+    i += 1 + p[i]; /* legacy_cookie */
+    if (i + 2 > n)
+        return 0;
+    i += 2 + get16(p + i); /* cipher_suites */
+    if (i + 1 > n)
+        return 0;
+    i += 1 + p[i]; /* legacy_compression_methods */
+    if (i + 2 > n)
+        return 0;
+    end = i + 2 + get16(p + i);
+    for (i += 2; i + 4 <= n && i + 4 <= end; i += 4 + get16(p + i + 2)) {
+        if (get16(p + i) == type) {
+            *len = get16(p + i + 2);
+            return i + 4;
+        }
+    }
+    return 0;
+}
+
+/* Whether a datagram carries a CH1 whose key_share is not exactly the requested one. */
+static int ch1_has_other_share(const unsigned char *b, int n)
+{
+    int off = 0;
+    while (off + 13 <= n && (b[off] & 0xE0) != 0x20) {
+        unsigned len = get16(b + off + 11), body = (unsigned)off + 13, h;
+        if (body + len > (unsigned)n)
+            break;
+        for (h = body; b[off] == 22 && h + 12 <= body + len; h += 12 + get24(b + h + 9)) {
+            const unsigned char *p = b + h + 12;
+            unsigned avail = body + len - (h + 12), frag_len = get24(b + h + 9), ext, ext_len = 0;
+            if (b[h] != 1 || get16(b + h + 4) != 0 || get24(b + h + 6) != 0)
+                continue;
+            ext = client_hello_ext(p, frag_len < avail ? frag_len : avail, EXT_KEY_SHARE, &ext_len);
+            /* One entry: 2-byte list length, group, 2-byte key length, key. */
+            return ext == 0 || ext_len < 6 || get16(p + ext) != ext_len - 2 ||
+                   get16(p + ext + 2) != g_want_share || get16(p + ext + 4) != ext_len - 6;
+        }
+        off = (int)(body + len);
+    }
+    return 0;
+}
+
 static int recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
 {
     int r = EmbedReceiveFrom(ssl, buf, sz, ctx);
@@ -267,7 +320,13 @@ static int recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
 
 static int send_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
 {
-    int r = EmbedSendTo(ssl, buf, sz, ctx);
+    int r;
+    /* WOLFSSL_DTLS_CH_FRAG empties a CH1 key_share that does not fit the MTU (src/tls13.c). */
+    if (g_want_share != 0 && ch1_has_other_share((const unsigned char *)buf, sz)) {
+        g_share_replaced = 1;
+        return WOLFSSL_CBIO_ERR_GENERAL;
+    }
+    r = EmbedSendTo(ssl, buf, sz, ctx);
     if (r > 0)
         inspect_datagram("tx", (const unsigned char *)buf, r, !g_is_client);
     return r;
@@ -348,48 +407,34 @@ static void forbid(const char *value, const char *name, const char *role)
 
 static void parse_args(int argc, char **argv, struct options *o)
 {
-    enum { O_ROLE = 1, O_VARIANT, O_HOST, O_PORT, O_GROUPS, O_MTU, O_CA,
-           O_KEY_SHARE, O_VALIDATE, O_CERT, O_KEY, O_COUNT };
-    static const struct option longopts[] = {
-        {"role", required_argument, NULL, O_ROLE},
-        {"variant", required_argument, NULL, O_VARIANT},
-        {"host", required_argument, NULL, O_HOST},
-        {"port", required_argument, NULL, O_PORT},
-        {"groups", required_argument, NULL, O_GROUPS},
-        {"mtu", required_argument, NULL, O_MTU},
-        {"ca", required_argument, NULL, O_CA},
-        {"key-share", required_argument, NULL, O_KEY_SHARE},
-        {"validate", required_argument, NULL, O_VALIDATE},
-        {"cert", required_argument, NULL, O_CERT},
-        {"key", required_argument, NULL, O_KEY},
-        {NULL, 0, NULL, 0},
-    };
-    const char **slots[O_COUNT];
-    size_t i;
-    int c, known = 0;
+    static const char *const names[] = {"role", "variant", "host", "port", "groups", "mtu",
+                                        "ca", "key-share", "validate", "cert", "key"};
+    const char **slots[] = {&o->role, &o->variant, &o->host, &o->port, &o->groups, &o->mtu,
+                            &o->ca, &o->key_share, &o->validate, &o->cert, &o->key};
+    size_t i, c;
+    int a, known = 0;
 
     memset(o, 0, sizeof(*o));
-    slots[O_ROLE] = &o->role;
-    slots[O_VARIANT] = &o->variant;
-    slots[O_HOST] = &o->host;
-    slots[O_PORT] = &o->port;
-    slots[O_GROUPS] = &o->groups;
-    slots[O_MTU] = &o->mtu;
-    slots[O_CA] = &o->ca;
-    slots[O_KEY_SHARE] = &o->key_share;
-    slots[O_VALIDATE] = &o->validate;
-    slots[O_CERT] = &o->cert;
-    slots[O_KEY] = &o->key;
-    opterr = 0;
-    while ((c = getopt_long(argc, argv, ":", longopts, NULL)) != -1) {
-        if (c <= 0 || c >= O_COUNT)
-            usage_error("unknown option or missing value: %s", argv[optind - 1]);
+    /* Exact names only: getopt_long would also accept abbreviations such as --group. */
+    for (a = 1; a < argc; a++) {
+        const char *arg = argv[a], *eq = strchr(arg, '=');
+        size_t len;
+        if (strncmp(arg, "--", 2) != 0)
+            usage_error("unexpected argument: %s", arg);
+        len = (eq != NULL ? (size_t)(eq - arg) : strlen(arg)) - 2;
+        for (c = 0; c < sizeof(names) / sizeof(names[0]); c++)
+            if (strlen(names[c]) == len && strncmp(arg + 2, names[c], len) == 0)
+                break;
+        if (c == sizeof(names) / sizeof(names[0]))
+            usage_error("unknown option: %s", arg);
+        if (eq == NULL && a + 1 == argc)
+            usage_error("missing value for %s", arg);
         if (*slots[c] != NULL)
-            usage_error("--%s given twice", longopts[c - 1].name);
-        *slots[c] = optarg;
+            usage_error("--%s given twice", names[c]);
+        *slots[c] = eq != NULL ? eq + 1 : argv[++a];
+        if (**slots[c] == '\0')
+            usage_error("--%s must not be empty", names[c]);
     }
-    if (optind != argc)
-        usage_error("unexpected argument: %s", argv[optind]);
 
     require(o->role, "role");
     if (strcmp(o->role, "client") != 0 && strcmp(o->role, "server") != 0)
@@ -471,6 +516,7 @@ static void apply_key_share(WOLFSSL *ssl, const char *key_share)
     ret = wolfSSL_UseKeyShare(ssl, (word16)g->id);
     if (ret != WOLFSSL_SUCCESS)
         fail(EXIT_UNSUPPORTED, "wolfSSL_UseKeyShare(%s) failed: %d", key_share, ret);
+    g_want_share = (unsigned)g->id;
 }
 
 /* Returns the socket; for the server also binds it and stores the bound port. */
@@ -707,6 +753,13 @@ int main(int argc, char **argv)
         printf("{\"event\": \"ready\", \"port\": %d}\n", port);
 
     ret = handshake(ssl, accept_tls13);
+    if (ret != WOLFSSL_SUCCESS && g_share_replaced) {
+        g_handshake_started = 0; /* nothing was sent */
+        fail(EXIT_UNSUPPORTED,
+             "unsupported: CH1 with the --key-share=%s share exceeds the MTU, and wolfSSL "
+             "sends an empty key_share instead of fragmenting CH1",
+             o.key_share);
+    }
     if (ret != WOLFSSL_SUCCESS)
         finish_fail(ssl, ret, "handshake");
     version = wolfSSL_get_version(ssl);

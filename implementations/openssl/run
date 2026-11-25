@@ -4,7 +4,7 @@ dir=$(cd "$(dirname "$0")" && pwd)
 bin="$dir/../../.build/openssl/bin/dtls-adapter"
 if [ ! -x "$bin" ]; then
     echo "openssl adapter not built; run implementations/openssl/build.sh" >&2
-    echo '{"event": "result", "ok": false, "version": null, "group": null, "hrr": null, "error": "adapter not built"}'
+    echo '{"event": "result", "ok": false, "version": null, "group": null, "hrr": null, "hrr_cookie": null, "hrr_group": null, "error": "adapter not built"}'
     exit 1
 fi
 exec "$bin" "$@"
