@@ -45,7 +45,7 @@ def test_list(impl_root, module):
     assert "  echo-unbuilt  not built" in lines
     assert "  S01  X25519, full share, PMTU 1500, no validation" in lines
     assert any(line.startswith("  T01  ") for line in lines)
-    assert "  S08+split  S08, client MTU and PMTU 1500, proxy splits CH1 in two" in lines
+    assert "  S08+split  S08, MTU 1500 on path and peers, proxy splits CH1 in two" in lines
 
 
 def test_run_all_built_pairs(impl_root, tmp_path):

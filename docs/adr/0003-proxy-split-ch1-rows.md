@@ -29,7 +29,7 @@ Rejected: one scenario ID would stand for two configurations, and the results tr
 Rejected: wolfSSL's CH1 at MTU 1280 has an empty share, so the case still tests the HRR path and fails the base expectations.
 4. Client MTU 1500 on a 1280 path, with the proxy splitting every client ClientHello record, CH2 included.
 Rejected: the proxy would rewrite more of the client's behaviour, and a client that assumes 1500 on a 1280 path is not a configuration anyone deploys.
-5. Separate matrix rows with the client MTU and the path PMTU at 1500 and only CH1 split.
+5. Separate matrix rows with the path PMTU and both peers' MTU at 1500 and only CH1 split.
 
 ## Decision
 
@@ -37,11 +37,13 @@ Option 5.
 Every scenario that expects a fragmented CH1 gets a derived row `<ID>+split` (today S03+split, S04+split, S08+split, S09+split), defined in `scenarios.py` and listed in docs/test-matrix.md.
 A derived row differs from its base row only in:
 
-- client `--mtu` and path PMTU 1500, so a full-share CH1 fits one datagram and nothing the client sends is dropped by the path;
+- path PMTU and the `--mtu` of client and server 1500 (one value, `SPLIT_MTU`), so a full-share CH1 fits one datagram and nothing either peer sends is dropped by the path;
 - `PathConditions.split_ch1 = 2`: the proxy splits an unfragmented CH1 into two fragments, before any impairment rule, so S08+split reorders and S09+split drops the proxy's fragments;
 - the client's CH1 fragmentation is not checked; every other expectation is the base row's.
 
-The server options stay those of the base row, so the server's flights are the same as in the base row.
+The other server options stay those of the base row.
+The server MTU follows the path: at 1280 on a 1500 path it would be inconsistent, and it would make servers without an MTU API (NSS, at most 1417-byte datagrams) unsupported in rows that do not need 1280.
+So the server's flights can be larger than in the base row.
 The rows run for every client; a client that fragments CH1 itself (OpenSSL) has its CH1 split the same way and acts as the control.
 
 Every result states what the proxy did, separately from what the client did:
@@ -53,11 +55,11 @@ Every result states what the proxy did, separately from what the client did:
 ## Consequences
 
 - A split row says how a server handles a fragmented CH1 with this client's content and retransmission behaviour, not how the client behaves at PMTU 1280; the base row keeps answering that.
-- Client-to-server datagrams in split rows can be up to 1452 bytes, so they do not test the server's receive path at 1280.
+- Datagrams in split rows can be up to 1452 bytes in both directions, so these rows test neither peer at 1280.
 - Matrix size grows by four rows per client and server pair.
 - A future client that fragments CH1 even at MTU 1500 is left alone by the rule; its row then tests its own fragments, and `path.actions` shows no split.
 
-First results (OpenSSL 4.1.0, wolfSSL 5.9.4, 2026-11-24):
+First results (OpenSSL 4.1.0, wolfSSL 5.9.4, 2026-11-24; unchanged on 2026-11-25 with the server MTU at 1500):
 
 - OpenSSL servers (listener and `accept`) pass all four split rows with a wolfSSL client.
 - wolfSSL servers drop the split CH1 exactly as they drop OpenSSL's fragmented CH1: `default` in all four rows, `accept-tls13` with the cookie (S04, S08, S09); `accept-tls13` passes S03+split.

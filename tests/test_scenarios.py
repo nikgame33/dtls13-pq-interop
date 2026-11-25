@@ -69,7 +69,7 @@ def test_impairments_only_where_the_matrix_says():
     }
 
 
-def test_split_rows_change_only_the_client_mtu_path_and_ch1_expectation():
+def test_split_rows_change_only_the_mtu_path_and_ch1_expectation():
     split = [s for s in SCENARIOS if s.path.split_ch1 is not None]
     assert [s.id for s in split] == ["S03+split", "S04+split", "S08+split", "S09+split"]
     for s in split:
@@ -77,7 +77,7 @@ def test_split_rows_change_only_the_client_mtu_path_and_ch1_expectation():
         assert base.expected.ch1_fragmented is True and base.path.split_ch1 is None
         assert s.path == dataclasses.replace(base.path, pmtu=1500, split_ch1=2)
         assert s.client == dataclasses.replace(base.client, mtu=1500)
-        assert s.server == base.server
+        assert s.server == dataclasses.replace(base.server, mtu=1500)
         assert s.expected.ch1_fragmented is None
         assert dataclasses.replace(s.expected, summary="", ch1_fragmented=True) == (
             dataclasses.replace(base.expected, summary="")

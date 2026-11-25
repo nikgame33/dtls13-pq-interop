@@ -255,7 +255,8 @@ def _build() -> tuple[Scenario, ...]:
 SPLIT_SUFFIX = "+split"
 SPLIT_FRAGMENTS = 2
 # Lets a client that never fragments CH1 (wolfSSL) send its full share: CH1 must fit one datagram.
-SPLIT_CLIENT_MTU = 1500
+# The row's only MTU: path PMTU and both peers' --mtu.
+SPLIT_MTU = 1500
 
 
 def _split_row(base: Scenario) -> Scenario:
@@ -263,9 +264,10 @@ def _split_row(base: Scenario) -> Scenario:
     return replace(
         base,
         id=base.id + SPLIT_SUFFIX,
-        description=f"{base.id}, client MTU and PMTU {SPLIT_CLIENT_MTU}, proxy splits CH1 in two",
-        client=replace(base.client, mtu=SPLIT_CLIENT_MTU),
-        path=replace(base.path, pmtu=SPLIT_CLIENT_MTU, split_ch1=SPLIT_FRAGMENTS),
+        description=f"{base.id}, MTU {SPLIT_MTU} on path and peers, proxy splits CH1 in two",
+        client=replace(base.client, mtu=SPLIT_MTU),
+        server=replace(base.server, mtu=SPLIT_MTU),
+        path=replace(base.path, pmtu=SPLIT_MTU, split_ch1=SPLIT_FRAGMENTS),
         expected=replace(
             base.expected,
             summary=f"As {base.id}; CH1 reaches the server in {SPLIT_FRAGMENTS} fragments",

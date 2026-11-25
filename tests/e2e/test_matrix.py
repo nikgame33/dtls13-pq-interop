@@ -101,6 +101,7 @@ def test_wolfssl_client_through_split_rows_to_openssl(matrix):
         # The client sent one CH1 with the full share; the proxy split it.
         assert case.ch1_fragments == 1 and case.ch1_size > 1232
         assert case.path.split_ch1 == 2 and case.path.actions[SPLIT] >= 1
+        assert case.path.pmtu == 1500 and "--mtu=1500" in case.server.command
         assert case.client.result is not None and case.client.result["hrr_group"] is False
         fragments = delivered_ch1_fragments(case_trace(run_dir, case))
         assert fragments and all(length < total for _, length, total in fragments)

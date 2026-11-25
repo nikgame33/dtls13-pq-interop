@@ -40,16 +40,16 @@ Every scenario runs for every (client, server) pair, including same-implementati
 The wolfSSL client never fragments CH1: if CH1 does not fit its MTU, it sends an empty `key_share` instead.
 So S03, S04, S08 and S09 never show a server a fragmented CH1 from it; with `--key-share=GROUP` the adapter reports them as unsupported once PR #9 lands.
 Each scenario that expects a fragmented CH1 therefore also runs as `<ID>+split` ([ADR 0003](adr/0003-proxy-split-ch1-rows.md)).
-Client `--mtu` and PMTU are 1500, so a full-share CH1 fits one datagram, and the proxy delivers an unfragmented CH1 as two fragments.
-Server options, impairments and expectations are those of the base row, except that the client's CH1 fragmentation is not checked.
+PMTU and both peers' `--mtu` are 1500, so a full-share CH1 fits one datagram, and the proxy delivers an unfragmented CH1 as two fragments.
+The other server options, impairments and expectations are those of the base row, except that the client's CH1 fragmentation is not checked.
 Every client runs these rows; clients that fragment CH1 themselves are the control.
 
 | ID | Description | Expected outcome |
 |---|---|---|
-| S03+split | S03, client MTU and PMTU 1500, proxy splits CH1 in two | As S03; CH1 reaches the server in 2 fragments |
-| S04+split | S04, client MTU and PMTU 1500, proxy splits CH1 in two | As S04; CH1 reaches the server in 2 fragments |
-| S08+split | S08, client MTU and PMTU 1500, proxy splits CH1 in two | As S08; CH1 reaches the server in 2 fragments |
-| S09+split | S09, client MTU and PMTU 1500, proxy splits CH1 in two | As S09; CH1 reaches the server in 2 fragments |
+| S03+split | S03, MTU 1500 on path and peers, proxy splits CH1 in two | As S03; CH1 reaches the server in 2 fragments |
+| S04+split | S04, MTU 1500 on path and peers, proxy splits CH1 in two | As S04; CH1 reaches the server in 2 fragments |
+| S08+split | S08, MTU 1500 on path and peers, proxy splits CH1 in two | As S08; CH1 reaches the server in 2 fragments |
+| S09+split | S09, MTU 1500 on path and peers, proxy splits CH1 in two | As S09; CH1 reaches the server in 2 fragments |
 
 ## Recorded per run
 
