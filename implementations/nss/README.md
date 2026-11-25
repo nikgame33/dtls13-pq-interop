@@ -11,7 +11,8 @@ The NSS command-line tools need zlib headers, hence `apt-packages.txt`.
 The adapter is a small C program on libssl rather than `tstclnt`/`selfserv`.
 Those tools have DTLS (`-P`) and a group list (`-I`), but no control over the key share, the HRR cookie or the MTU, and no machine-readable result.
 It calls `NSS_NoDB_Init`: no certificate or key database, no built-in roots and no policy file, so nothing outside the pinned build and the options affects a run.
-Both roles pin the protocol to DTLS 1.3 (`SSL_VersionRangeSet` with `SSL_LIBRARY_VERSION_TLS_1_3` as minimum and maximum on a `DTLS_ImportFD` socket).
+Both roles pin the protocol to (D)TLS 1.3 (`SSL_VersionRangeSet` with `SSL_LIBRARY_VERSION_TLS_1_3` as minimum and maximum).
+`transports` declares `dtls` and `tls`: DTLS uses a `DTLS_ImportFD` socket on UDP, TLS an `SSL_ImportFD` socket on TCP, with the same code otherwise.
 There are no variants: libssl has one DTLS code path per role, so `--variant` accepts only `default`.
 
 ## Option mapping
@@ -27,15 +28,20 @@ A missing, unknown, repeated or other-role option and a malformed or empty value
 | `--key-share=GROUP` | `SSL_SendAdditionalKeyShares(fd, 0)`: one share, for the first group; GROUP must be the first `--groups` entry (else exit 2) and in `--groups` (else exit 64) |
 | `--key-share=default` | Nothing is called; NSS sends one share for its first group |
 | `--key-share=empty` | Unsupported, exit 2 (see below) |
-| `--mtu=N` | Nothing to configure; N - 48 must be at least 1417 (else exit 2), and every sent datagram is checked against it, see MTU |
+| `--transport=dtls` | UDP socket, `PR_ImportUDPSocket` + `DTLS_ImportFD` |
+| `--transport=tls` | TCP socket, `PR_ImportTCPSocket` + `SSL_ImportFD`; the server `listen`s and `accept`s one connection per handshake |
+| `--resume=ticket` | Two connections, see Resumption |
+| `--resume=off` | One connection |
+| `--mtu=N` (TLS) | Exit 64: TLS over TCP takes only `--mtu=default` |
+| `--mtu=N` (DTLS) | Nothing to configure; N - 48 must be at least 1417 (else exit 2), and every sent datagram is checked against it, see MTU |
 | `--mtu=default` | Nothing is configured |
-| `--validate=cookie` | `SSL_HelloRetryRequestCallback`: the first ClientHello gets an HRR whose cookie carries the peer address as application token; the second is accepted only with that token |
+| `--validate=cookie` | DTLS and TLS: `SSL_HelloRetryRequestCallback`: the first ClientHello gets an HRR whose cookie carries the peer address as application token; the second is accepted only with that token |
 | `--validate=off` | No callback |
 | `--cert/--key` | PEM decoded with `ATOB_ConvertAsciiToItem`; `CERT_NewTempCertificate` for every certificate, `PK11_ImportDERPrivateKeyInfoAndReturnKey` (PKCS#8) for the key, then `SSL_ConfigServerCert` |
 | `--ca` | Client: `CERT_NewTempCertificate` + `CERT_ChangeCertTrust("C,,")`, `SSL_SetURL("localhost")`, and `SSL_AuthCertificate` in the auth hook; server: required but unused (no client authentication) |
 
-The server binds, prints the ready line, waits for the first datagram (`recvfrom` with `MSG_PEEK`) and `connect`s the socket to its sender, because an NSS DTLS socket serves exactly one peer.
-The socket is wrapped with `PR_ImportUDPSocket` and an NSPR I/O layer that logs and checks every datagram before `DTLS_ImportFD`.
+The DTLS server binds, prints the ready line, waits for the first datagram (`recvfrom` with `MSG_PEEK`) and `connect`s the socket to its sender, because an NSS DTLS socket serves exactly one peer.
+The socket is wrapped with `PR_ImportUDPSocket` (TLS: `PR_ImportTCPSocket`) and an NSPR I/O layer that logs and checks every datagram (TLS: every TCP read and write, parsed into records) before `DTLS_ImportFD` (TLS: `SSL_ImportFD`).
 The handshake is driven non-blocking with `SSL_ForceHandshake`, `PR_Poll` and `DTLS_GetHandshakeTimeout` for the retransmission timer, with a 60 s limit.
 
 ### Groups
@@ -47,6 +53,20 @@ The adapter's I/O layer therefore reassembles each received ClientHello before l
 NSS then takes the highest-ranked server group with a share (rule 1), or sends an HRR for the highest-ranked server group the client supports (rule 2), or fails with `SSL_ERROR_NO_CYPHER_OVERLAP` (rule 3).
 The new order is logged (`NSS group order: ...`); the tests cover all three rules and a three-group case the unaided server gets wrong.
 See ADR 0007.
+
+### Resumption
+
+With `--resume=ticket` the client runs two connections, each from a new socket and so a new local port (logged as `socket: local port N`).
+Connection 1 registers `SSL_SetResumptionTokenCallback` and keeps the token it delivers after the NewSessionTicket (logged as `resumption token (N bytes)`); connection 2 passes it to `SSL_SetResumptionToken` before the handshake.
+Without a token after connection 1's `pong` the client exits 1 with `connection 1: no session ticket received`.
+`SSL_SetResumptionToken` and the callback are declared in `sslexp.h` (experimental API) and exported by libssl3.
+The server enables `SSL_ENABLE_SESSION_TICKETS`, because the NSS default is off (`ssl_defaults` in `lib/ssl/sslsock.c`) and an NSS server then sends no NewSessionTicket (the `ss->opt.enableSessionTickets` check in `tls13_ServerHandleFinished`, `lib/ssl/tls13con.c`).
+Tickets are protected with the process-wide self-encrypt keys (`ssl_SelfEncryptProtect`, `lib/ssl/sslsnce.c`), and `SSL_ConfigServerSessionIDCache` is set up once, so both server connections share one library context.
+The server prints the ready line once.
+For TLS it `accept`s the second connection on the same listening socket.
+For DTLS, where the first socket is `connect`ed to peer 1, it binds a second UDP socket to the same port with `SO_REUSEADDR` before connection 2 starts; when peeking for the next peer it drops late datagrams from peer 1 (logged as `dropping a late datagram from connection 1's peer`) and then `connect`s to the new sender.
+Every ClientHello with a `pre_shared_key` extension is logged as `ClientHello offers a PSK (pre_shared_key)`.
+After option parsing every error line and the `error` field start with `connection N: `; the result line describes the last connection, and `resumed` is `SSLChannelInfo.resumed`.
 
 ### MTU
 
@@ -60,7 +80,8 @@ See ADR 0007 for the alternatives that were rejected.
 
 ## Result fields
 
-- `version`: `SSL_GetChannelInfo` `protocolVersion`; `0x0304` is reported as `DTLSv1.3`.
+- `version`: `SSL_GetChannelInfo` `protocolVersion`; `0x0304` is reported as `DTLSv1.3` or `TLSv1.3`, by transport.
+- `resumed`: `SSLChannelInfo.resumed`, `null` if the handshake did not finish.
 - `group`: `SSLChannelInfo.keaGroup`, mapped to its IANA name.
 - `hrr`, `hrr_cookie`, `hrr_group`: the I/O layer reassembles the plaintext handshake messages of both directions; a ServerHello with the HRR random (RFC 9846 section 4.2.3) is the HRR, and its extensions are scanned for cookie (44) and key_share (51, the selected_group).
 - `error`: the NSPR/NSS error name and text, e.g. `handshake: SSL_ERROR_NO_CYPHER_OVERLAP: ...`; a failed server certificate check is reported as `certificate verify failed: SEC_ERROR_UNKNOWN_ISSUER`.
@@ -72,20 +93,21 @@ stderr logs every datagram, record, handshake message and alert with its size, t
 The client sends close_notify (`PR_Shutdown(PR_SHUTDOWN_SEND)`) after `pong` and waits up to 2 s for the server's.
 The server waits up to 2 s for the client's close_notify and only then sends its own.
 The I/O layer turns `shutdown(2)` into a no-op, so the UDP socket stays usable for late ACKs.
+With `--resume=ticket` both connections are torn down this way before the next one starts.
 Errors after `pong` only go to stderr.
 
 ## Unsupported
 
 - `--key-share=empty`: `tls13_SetupClientHello` creates a share for the first enabled group and fails with `SSL_ERROR_NO_CIPHERS_SUPPORTED` if there is none, so an NSS client cannot send an empty `key_share`.
 - `--key-share=GROUP` for any group but the first `--groups` entry: NSS shares for the first `1 + additionalShares` groups of its list, which is also the supported_groups order.
-- `--mtu` below 1465 (exit 2), see MTU.
+- `--mtu` below 1465 with DTLS (exit 2), see MTU; S10 at PMTU 1280 is therefore unsupported too.
 - Groups NSS 3.134 does not implement, notably `MLKEM512X25519` and pure `MLKEM768`; any such group in `--groups` makes either role exit 2.
 Implemented: `X25519`, `secp256r1`, `secp384r1`, `secp521r1`, `X25519MLKEM768`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024`, `MLKEM1024` and `ffdhe2048` to `ffdhe8192`.
 
 ## Observed NSS behaviour
 
 - Every NSS HRR carries a cookie, also with `--validate=off`: `tls13_SendHelloRetryRequest` always calls `tls13_MakeHrrCookie` (NSS servers keep no state across an HRR).
-So a group-only HRR reports `hrr_cookie: true`.
+So a group-only HRR reports `hrr_cookie: true`, on DTLS and TLS alike; the contract allows such a library-forced cookie with `--validate=off` (docs/shim-interface.md).
 - With X25519MLKEM768 the CH1 record is 1374 bytes and never fragmented, since it is below the 1383-byte fragment limit; CH2 after a cookie HRR (about 1500 bytes) is sent as two records.
 - At `--mtu=default` the server flight fills 1417-byte datagrams.
 On a path below 1465 bytes NSS shrinks its estimate only on every third retransmission timeout (`dtls_RetransmitTimerExpiredCb` in `lib/ssl/dtlscon.c`); behind a 1280-byte proxy path the CH1 then goes out as 1188 + 224 bytes after about 350 ms.

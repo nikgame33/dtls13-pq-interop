@@ -25,10 +25,15 @@ MTU: `--mtu=N` with N - 48 >= 1417 (N >= 1465) runs with NSS's built-in estimate
 `--mtu=default` also configures nothing.
 The I/O layer refuses any datagram above N - 48, so a wrong assumption fails a run instead of silently breaking the limit.
 
+Transport and resumption (ADR 0004): TLS over TCP is declared, because `SSL_ImportFD` on a TCP socket shares all other code with DTLS.
+`--resume=ticket` uses the token API (`SSL_SetResumptionTokenCallback`, `SSL_SetResumptionToken`) and enables `SSL_ENABLE_SESSION_TICKETS` on the server, which NSS has off by default.
+The DTLS server binds a second UDP socket to its port with `SO_REUSEADDR` before connection 2, because the first one is `connect`ed to peer 1.
+
 ## Alternatives considered
 
 - Setting `ss->ssl3.mtu` through the private `sslimpl.h` layout, as `SSLInt_SetMTU` does: it would make `--mtu=1280` work, but depends on an unexported struct layout that can change in any release and is not how any NSS application can behave.
 - Dropping oversize datagrams in the I/O layer so that NSS's own backoff shrinks the estimate: it never exceeds N - 48 on the wire, but it adds retransmission delays and local losses that the scenario did not ask for, and it reaches only the table values 1252, 548 and 228, not N - 48.
+- DTLS resumption on the first socket after `connect(AF_UNSPEC)`: it would also reach the new peer, but late datagrams of connection 1 would then race with connection 2's ClientHello on one socket.
 - Leaving the server's group order alone: NSS results would then reflect NSS's selection rule rather than the scenarios, contrary to ADR 0002.
 
 ## Consequences
@@ -36,4 +41,5 @@ The I/O layer refuses any datagram above N - 48, so a wrong assumption fails a r
 - The NSS rows of all scenarios at `--mtu=1280` (S03, S04, S07 to S10) report unsupported, which is NSS's real limitation: no application can configure the DTLS MTU.
 - How NSS behaves on a 1280-byte path can still be measured with `--mtu=default` behind the proxy; that would need new scenarios and is left to the project owner.
 - On a real 1280-byte path NSS shrinks only after three retransmission timeouts, and never while the peer ACKs partial flights (`dtls13_HandleAck` resends and restarts the timer); the README records the measurements.
+- S10 for NSS runs only over TLS (T01) or at `--mtu=default`; the S10 rows at PMTU 1280 are unsupported like S03.
 - The group reordering relies on `SSL_NamedGroupConfig` being callable between two reads during a handshake, which holds for 3.134 and is covered by the adapter tests.
