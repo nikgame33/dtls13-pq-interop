@@ -78,6 +78,8 @@ class Adapters:
             "host": HOST,
             "port": str(port),
             "groups": "X25519",
+            "transport": "dtls",
+            "resume": "off",
             "mtu": "1500",
             "ca": str(self.pki.ca_cert),
         }
@@ -130,9 +132,18 @@ def _handshake(adapters: Adapters, server: dict, client: dict) -> tuple[Run, Run
     return cli, srv.finish()
 
 
-def _assert_ok(run: Run, group: str, hrr: bool, cookie: bool = False, hrr_group: bool = False):
-    expected = {"event": "result", "ok": True, "version": "DTLSv1.3", "group": group}
-    expected |= {"hrr": hrr, "hrr_cookie": cookie, "hrr_group": hrr_group, "error": None}
+def _assert_ok(
+    run: Run,
+    group: str,
+    hrr: bool,
+    cookie: bool = False,
+    hrr_group: bool = False,
+    version: str = "DTLSv1.3",
+    resumed: bool = False,
+) -> None:
+    expected = {"event": "result", "ok": True, "version": version, "group": group}
+    expected |= {"hrr": hrr, "hrr_cookie": cookie, "hrr_group": hrr_group}
+    expected |= {"resumed": resumed, "error": None}
     assert (run.code, run.result) == (0, expected), run.stderr
 
 
@@ -298,7 +309,8 @@ def test_default_mtu_is_library_default(adapters: Adapters) -> None:
 
 def _assert_no_handshake(run: Run, code: int, error: str) -> None:
     expected = {"event": "result", "ok": False, "version": None, "group": None, "hrr": None}
-    expected |= {"hrr_cookie": None, "hrr_group": None, "error": run.result["error"]}
+    expected |= {"hrr_cookie": None, "hrr_group": None, "resumed": None}
+    expected["error"] = run.result["error"]
     assert (run.code, run.result) == (code, expected), run.stderr
     assert error in run.result["error"], run.result
 
@@ -354,6 +366,10 @@ USAGE_ERRORS = {
         "share-not-in-groups": {"key_share": MLKEM},
         "empty-group": {"groups": "X25519,,secp256r1"},
         "duplicate-group": {"groups": "X25519,x25519"},
+        "missing-transport": {"transport": None},
+        "bad-transport": {"transport": "udp"},
+        "tls-numeric-mtu": {"transport": "tls", "mtu": "1280"},
+        "abbreviated-option": {"groups": None, "group": "X25519"},
     },
     "server": {
         "missing-validate": {"validate": None},
@@ -364,7 +380,9 @@ USAGE_ERRORS = {
         "bad-port": {"port": "70000"},
         "bad-mtu": {"mtu": "48"},
         "bad-variant": {"variant": "accept"},
-        "tls-transport": {"transport": "tls"},
+        "tls-numeric-mtu": {"transport": "tls", "mtu": "1500"},
+        "missing-resume": {"resume": None},
+        "bad-resume": {"resume": "psk"},
     },
 }
 
@@ -394,6 +412,84 @@ def test_client_rejects_untrusted_server(adapters: Adapters, tmp_path: Path) -> 
     assert cli.result["ok"] is False
     assert cli.result["error"] == "handshake: CERTIFICATE_VERIFY_FAILED", cli.result
     assert srv.finish().code == 1
+
+
+# --- TLS transport and resumption (docs/adr/0004-psk-resumption-and-tls-transport.md) ----------
+
+TLS = {"transport": "tls", "mtu": "default"}
+
+
+def test_tls_self_interop(adapters: Adapters) -> None:
+    """TLS 1.3 over TCP; both sides see the peer's close_notify."""
+    cli, srv = _handshake(adapters, server=TLS, client={**TLS, "key_share": "X25519"})
+    _assert_ok(cli, "X25519", hrr=False, version="TLSv1.3")
+    _assert_ok(srv, "X25519", hrr=False, version="TLSv1.3")
+    for run in (cli, srv):
+        assert "<< alert close notify" in run.stderr, run.stderr
+
+
+def test_tls_wrong_guess_triggers_hrr(adapters: Adapters) -> None:
+    cli, srv = _handshake(
+        adapters,
+        server={**TLS, "groups": MLKEM},
+        client={**TLS, "groups": f"X25519,{MLKEM}", "key_share": "X25519"},
+    )
+    _assert_ok(cli, MLKEM, hrr=True, hrr_group=True, version="TLSv1.3")
+    _assert_ok(srv, MLKEM, hrr=True, hrr_group=True, version="TLSv1.3")
+    assert _client_hellos(srv, "<<") == ["X25519", MLKEM], srv.stderr
+
+
+def test_tls_cookie_validation_reported_unsupported(adapters: Adapters) -> None:
+    run = adapters.run(adapters.args("server", **TLS, validate="cookie"))
+    _assert_no_handshake(run, 2, "--validate=cookie not possible")
+
+
+@pytest.mark.parametrize("transport", ["dtls", "tls"])
+def test_resumption(adapters: Adapters, transport: str) -> None:
+    """--resume=ticket: connection 2 offers the ticket from connection 1 and is resumed."""
+    opts = {"transport": transport, "mtu": "default" if transport == "tls" else "1500"}
+    cli, srv = _handshake(
+        adapters,
+        server={**opts, "resume": "ticket"},
+        client={**opts, "resume": "ticket", "key_share": "X25519"},
+    )
+    version = "TLSv1.3" if transport == "tls" else "DTLSv1.3"
+    _assert_ok(cli, "X25519", hrr=False, version=version, resumed=True)
+    _assert_ok(srv, "X25519", hrr=False, version=version, resumed=True)
+    assert "session ticket received" in cli.stderr, cli.stderr
+    assert srv.stderr.count("handshake done:") == 2, srv.stderr
+
+
+def test_resumption_after_hrr_at_1280(adapters: Adapters) -> None:
+    """S10 without the cookie a BoringSSL server cannot send: a key share HRR in both
+    connections, so the client recomputes its PSK binder over the HRR (RFC 9846 sec 4.3.11.2)
+    and the fragmented CH2 carries the ticket."""
+    cli, srv = _handshake(
+        adapters,
+        server={"groups": MLKEM, "mtu": "1280", "resume": "ticket"},
+        client={
+            "groups": f"X25519,{MLKEM}",
+            "mtu": "1280",
+            "resume": "ticket",
+            "key_share": "X25519",
+        },
+    )
+    _assert_ok(cli, MLKEM, hrr=True, hrr_group=True, resumed=True)
+    _assert_ok(srv, MLKEM, hrr=True, hrr_group=True, resumed=True)
+    assert _client_hellos(srv, "<<") == ["X25519", MLKEM] * 2, srv.stderr
+    _assert_fits(cli, 1280)
+    _assert_fits(srv, 1280)
+
+
+def test_resume_errors_name_the_connection(adapters: Adapters) -> None:
+    run = adapters.run(adapters.args("server", resume="ticket", validate="cookie"))
+    _assert_no_handshake(run, 2, "--validate=cookie not possible")
+    assert run.result["error"].startswith("connection 1: "), run.result
+
+
+def test_resume_off_reports_not_resumed(adapters: Adapters) -> None:
+    cli, srv = _handshake(adapters, server={}, client={"key_share": "X25519"})
+    assert (cli.result["resumed"], srv.result["resumed"]) == (False, False)
 
 
 # --- Against other implementations -------------------------------------------------------------
@@ -474,6 +570,28 @@ def test_fragmented_pq_ch1_against_wolfssl_accept_tls13(adapters: Adapters, peer
     _assert_ok(cli, MLKEM, hrr=False)
     _assert_ok(srv, MLKEM, hrr=False)
     _assert_fits(cli, 1280)
+
+
+def test_resumption_after_cookie_hrr_against_openssl(adapters: Adapters, peer) -> None:
+    """S10: both connections fragment CH1 and CH2 at 1280, and CH2 carries cookie and PSK."""
+    opts = {"groups": MLKEM, "mtu": "1280", "resume": "ticket"}
+    cli, srv = _cross(
+        adapters, peer("openssl"), {**opts, "validate": "cookie"}, {**opts, "key_share": MLKEM}
+    )
+    _assert_ok(cli, MLKEM, hrr=True, cookie=True, resumed=True)
+    _assert_ok(srv, MLKEM, hrr=True, cookie=True, resumed=True)
+    _assert_fits(cli, 1280)
+
+
+@pytest.mark.parametrize("server", ["openssl", "wolfssl"])
+def test_tls_cookie_echo_against_other_servers(adapters: Adapters, peer, server: str) -> None:
+    """T01: a BoringSSL TLS client echoes the cookie of an OpenSSL or wolfSSL TLS server."""
+    opts = {**TLS, "groups": "X25519"}
+    cli, srv = _cross(
+        adapters, peer(server), {**opts, "validate": "cookie"}, {**opts, "key_share": "X25519"}
+    )
+    _assert_ok(cli, "X25519", hrr=True, cookie=True, version="TLSv1.3")
+    _assert_ok(srv, "X25519", hrr=True, cookie=True, version="TLSv1.3")
 
 
 @pytest.mark.parametrize("server", ["openssl", "wolfssl"])

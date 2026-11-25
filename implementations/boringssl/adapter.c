@@ -1,4 +1,4 @@
-/* DTLS 1.3 interop adapter for BoringSSL, implementing docs/shim-interface.md. */
+/* DTLS 1.3 / TLS 1.3 interop adapter for BoringSSL, implementing docs/shim-interface.md. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -39,11 +39,13 @@ enum { EXIT_OK = 0, EXIT_FAIL = 1, EXIT_UNSUPPORTED = 2, EXIT_USAGE = 64 };
 #define BSSL_MIN_PAYLOAD (256 - 28)
 #define DTLS_HM_HEADER_LEN 12
 #define DTLS_PLAINTEXT_HEADER_LEN 13
+#define TLS_HM_HEADER_LEN 4
+#define TLS_RECORD_HEADER_LEN 5
 
 enum { HRR_SEEN = 1, HRR_COOKIE = 2, HRR_GROUP = 4 };
 
 enum { OPT_ROLE, OPT_VARIANT, OPT_HOST, OPT_PORT, OPT_GROUPS, OPT_MTU, OPT_CA, OPT_KEY_SHARE,
-    OPT_VALIDATE, OPT_CERT, OPT_KEY, OPT_COUNT };
+    OPT_VALIDATE, OPT_CERT, OPT_KEY, OPT_TRANSPORT, OPT_RESUME, OPT_COUNT };
 
 static const struct option LONGOPTS[] = {
     { "role", required_argument, NULL, OPT_ROLE },
@@ -57,23 +59,28 @@ static const struct option LONGOPTS[] = {
     { "validate", required_argument, NULL, OPT_VALIDATE },
     { "cert", required_argument, NULL, OPT_CERT },
     { "key", required_argument, NULL, OPT_KEY },
+    { "transport", required_argument, NULL, OPT_TRANSPORT },
+    { "resume", required_argument, NULL, OPT_RESUME },
     { NULL, 0, NULL, 0 },
 };
 
 static const bool CLIENT_OPT[OPT_COUNT] = {
     [OPT_ROLE] = true, [OPT_VARIANT] = true, [OPT_HOST] = true, [OPT_PORT] = true,
     [OPT_GROUPS] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_KEY_SHARE] = true,
+    [OPT_TRANSPORT] = true, [OPT_RESUME] = true,
 };
 static const bool SERVER_OPT[OPT_COUNT] = {
     [OPT_ROLE] = true, [OPT_VARIANT] = true, [OPT_HOST] = true, [OPT_PORT] = true,
     [OPT_GROUPS] = true, [OPT_MTU] = true, [OPT_CA] = true, [OPT_VALIDATE] = true,
-    [OPT_CERT] = true, [OPT_KEY] = true,
+    [OPT_CERT] = true, [OPT_KEY] = true, [OPT_TRANSPORT] = true, [OPT_RESUME] = true,
 };
 
 struct options {
     const char *val[OPT_COUNT];
     bool server;
     bool cookie;
+    bool tls;    /* --transport=tls: TLS 1.3 over TCP */
+    bool resume; /* --resume=ticket: a second connection resumes the first */
     long mtu;
     long payload; /* largest UDP payload: mtu - IP_UDP_OVERHEAD, or 0 for --mtu=default */
 };
@@ -84,6 +91,13 @@ static size_t g_ngroups;
 static int g_fd = -1;
 static unsigned g_hrr;     /* HRR_* bits, set by the message callback */
 static bool g_started;     /* the handshake has begun, so hrr fields are known */
+static int g_conn;         /* connection number for error prefixes; 0 with --resume=off */
+static bool g_last = true; /* this connection's success ends the run, so it prints the result */
+/* DTLS server: the peer of the current connection; the socket stays unconnected so that the
+ * next connection's first datagram is never refused, and other sources are ignored. */
+static struct sockaddr_storage g_peer;
+static socklen_t g_peer_len;
+static SSL_SESSION *g_ticket; /* client: the latest resumable session from a NewSessionTicket */
 
 /* SHA-256("HelloRetryRequest"), RFC 9846 section 4.2.3. */
 static const uint8_t HRR_RANDOM[32] = {
@@ -149,6 +163,9 @@ static int finish(int code, SSL *ssl, bool handshake_done, const char *error)
     bool known = g_started && code != EXIT_UNSUPPORTED && code != EXIT_USAGE;
     unsigned hrr = g_hrr;
 
+    if (code == EXIT_OK && !g_last)
+        return code;
+
     /* The message callback and the library must agree; trust the library for hrr itself. */
     if (known && ssl != NULL && SSL_used_hello_retry_request(ssl))
         hrr |= HRR_SEEN;
@@ -162,8 +179,16 @@ static int finish(int code, SSL *ssl, bool handshake_done, const char *error)
     json_bool(known, (hrr & HRR_SEEN) && (hrr & HRR_COOKIE));
     fputs(", \"hrr_group\": ", stdout);
     json_bool(known, (hrr & HRR_SEEN) && (hrr & HRR_GROUP));
+    fputs(", \"resumed\": ", stdout);
+    json_bool(known && handshake_done, handshake_done && SSL_session_reused(ssl));
     fputs(", \"error\": ", stdout);
-    json_string(error);
+    if (error != NULL && g_conn > 0) {
+        char prefixed[320];
+
+        snprintf(prefixed, sizeof(prefixed), "connection %d: %s", g_conn, error);
+        json_string(prefixed);
+    } else
+        json_string(error);
     puts("}");
     fflush(stdout);
     return code;
@@ -228,9 +253,14 @@ static const char *hs_name(uint8_t type)
 }
 
 /* Walks the HRR extensions (RFC 9846 section 4.2.3 layout) for cookie and key_share. */
+static size_t hm_header_len(void)
+{
+    return g_opts.tls ? TLS_HM_HEADER_LEN : DTLS_HM_HEADER_LEN;
+}
+
 static unsigned hrr_flags(const uint8_t *p, size_t len)
 {
-    size_t off = DTLS_HM_HEADER_LEN + 2 + sizeof(HRR_RANDOM), end;
+    size_t off = hm_header_len() + 2 + sizeof(HRR_RANDOM), end;
     unsigned flags = HRR_SEEN;
 
     if (off >= len)
@@ -252,7 +282,7 @@ static unsigned hrr_flags(const uint8_t *p, size_t len)
 /* Writes the groups of a complete ClientHello's key_share extension to out, e.g. "X25519". */
 static void ch_key_shares(const uint8_t *p, size_t len, char *out, size_t out_len)
 {
-    size_t off = DTLS_HM_HEADER_LEN + 2 + 32, end;
+    size_t off = hm_header_len() + 2 + 32, end;
 
     snprintf(out, out_len, "none");
     if (off + 1 > len)
@@ -260,7 +290,8 @@ static void ch_key_shares(const uint8_t *p, size_t len, char *out, size_t out_le
     off += 1 + p[off]; /* session id */
     if (off + 1 > len)
         return;
-    off += 1 + p[off]; /* legacy DTLS cookie */
+    if (!g_opts.tls)
+        off += 1 + p[off]; /* legacy DTLS cookie */
     if (off + 2 > len)
         return;
     off += 2 + read_u16(p + off); /* cipher suites */
@@ -292,8 +323,8 @@ static void ch_key_shares(const uint8_t *p, size_t len, char *out, size_t out_le
     }
 }
 
-/* Sent handshake data arrives per fragment (12-byte DTLS header each), received as whole
- * messages; HRR is a ServerHello with a fixed random and always fits one fragment. */
+/* DTLS: sent handshake data arrives per fragment (12-byte header each), received as whole
+ * messages; HRR always fits one fragment. TLS: whole messages with a 4-byte header. */
 static void msg_cb(int write_p, int version, int content_type, const void *buf, size_t len,
     SSL *ssl, void *arg)
 {
@@ -304,8 +335,10 @@ static void msg_cb(int write_p, int version, int content_type, const void *buf, 
     (void)version, (void)ssl, (void)arg;
     if (content_type == SSL3_RT_HEADER) {
         /* Plaintext (epoch 0) record headers show how ClientHello and ServerHello were cut. */
-        if (len == DTLS_PLAINTEXT_HEADER_LEN && p[0] == SSL3_RT_HANDSHAKE)
+        if (len == DTLS_PLAINTEXT_HEADER_LEN && p[0] == SSL3_RT_HANDSHAKE && !g_opts.tls)
             fprintf(stderr, "%s plaintext handshake record (%u bytes)\n", dir, read_u16(p + 11));
+        else if (len == TLS_RECORD_HEADER_LEN && p[0] == SSL3_RT_HANDSHAKE && g_opts.tls)
+            fprintf(stderr, "%s plaintext handshake record (%u bytes)\n", dir, read_u16(p + 3));
         return;
     }
     if (content_type == SSL3_RT_ACK) {
@@ -316,14 +349,14 @@ static void msg_cb(int write_p, int version, int content_type, const void *buf, 
         fprintf(stderr, "%s alert %s\n", dir, SSL_alert_desc_string_long(p[1]));
         return;
     }
-    if (content_type != SSL3_RT_HANDSHAKE || len < DTLS_HM_HEADER_LEN)
+    if (content_type != SSL3_RT_HANDSHAKE || len < hm_header_len())
         return;
     msg_len = read_u24(p + 1);
-    offset = read_u24(p + 6);
-    frag_len = read_u24(p + 9);
+    offset = g_opts.tls ? 0 : read_u24(p + 6);
+    frag_len = g_opts.tls ? msg_len : read_u24(p + 9);
     if (p[0] == SSL3_MT_SERVER_HELLO && offset == 0
-        && len >= DTLS_HM_HEADER_LEN + 2 + sizeof(HRR_RANDOM)
-        && memcmp(p + DTLS_HM_HEADER_LEN + 2, HRR_RANDOM, sizeof(HRR_RANDOM)) == 0) {
+        && len >= hm_header_len() + 2 + sizeof(HRR_RANDOM)
+        && memcmp(p + hm_header_len() + 2, HRR_RANDOM, sizeof(HRR_RANDOM)) == 0) {
         g_hrr = hrr_flags(p, len);
         fprintf(stderr, "%s HelloRetryRequest (%u bytes, cookie=%d, selected_group=%d)\n", dir,
             msg_len, (g_hrr & HRR_COOKIE) != 0, (g_hrr & HRR_GROUP) != 0);
@@ -342,36 +375,52 @@ static void msg_cb(int write_p, int version, int content_type, const void *buf, 
         fprintf(stderr, "<< %s (%u bytes)\n", hs_name(p[0]), msg_len);
 }
 
-/* BoringSSL has no datagram BIO; this one sends and receives whole datagrams on the connected,
- * non-blocking socket and logs each one. It answers no MTU query, so --mtu=default gets the
- * library's built-in default. */
+/* BoringSSL has no datagram BIO; this one does send/recv on the non-blocking socket (UDP or TCP)
+ * and logs each call. It answers no MTU query, so --mtu=default gets the library default. */
+static const char *unit(void)
+{
+    return g_opts.tls ? "tcp" : "datagram";
+}
+
 static int udp_write(BIO *b, const char *buf, int len)
 {
     ssize_t n;
 
     BIO_clear_retry_flags(b);
-    n = send(g_fd, buf, (size_t)len, 0);
+    if (g_peer_len != 0)
+        n = sendto(g_fd, buf, (size_t)len, 0, (struct sockaddr *)&g_peer, g_peer_len);
+    else
+        n = send(g_fd, buf, (size_t)len, MSG_NOSIGNAL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             BIO_set_retry_write(b);
         return -1;
     }
-    fprintf(stderr, ">> datagram (%zd bytes)\n", n);
+    fprintf(stderr, ">> %s (%zd bytes)\n", unit(), n);
     return (int)n;
 }
 
 static int udp_read(BIO *b, char *buf, int len)
 {
+    struct sockaddr_storage from;
+    socklen_t from_len;
     ssize_t n;
 
     BIO_clear_retry_flags(b);
-    n = recv(g_fd, buf, (size_t)len, 0);
+    for (;;) {
+        from_len = sizeof(from);
+        n = recvfrom(g_fd, buf, (size_t)len, 0, (struct sockaddr *)&from, &from_len);
+        if (n < 0 || g_peer_len == 0
+            || (from_len == g_peer_len && memcmp(&from, &g_peer, from_len) == 0))
+            break;
+        fprintf(stderr, "<< ignored datagram (%zd bytes) from another peer\n", n);
+    }
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             BIO_set_retry_read(b);
         return -1;
     }
-    fprintf(stderr, "<< datagram (%zd bytes)\n", n);
+    fprintf(stderr, "<< %s (%zd bytes)\n", unit(), n);
     return (int)n;
 }
 
@@ -545,7 +594,7 @@ static int echo_and_close(SSL *ssl, bool server)
 {
     struct timespec deadline = deadline_in(HANDSHAKE_MS);
     char buf[64];
-    bool timed_out;
+    bool timed_out, need_ticket;
     int ret;
 
     if (!server && (ret = drive(ssl, OP_WRITE, "ping", 4, &deadline, &timed_out)) <= 0)
@@ -556,6 +605,7 @@ static int echo_and_close(SSL *ssl, bool server)
     if (ret != 4 || memcmp(buf, server ? "ping" : "pong", 4) != 0)
         return fail_msg(EXIT_FAIL, ssl, "unexpected %s (%d bytes)", server ? "message" : "echo",
             ret);
+    need_ticket = !server && g_opts.resume && g_conn == 1 && g_ticket == NULL;
     if (server && (ret = drive(ssl, OP_WRITE, "pong", 4, &deadline, &timed_out)) <= 0)
         return fail_drive(ssl, ret, timed_out, "writing pong", HANDSHAKE_MS);
 
@@ -567,6 +617,8 @@ static int echo_and_close(SSL *ssl, bool server)
         send_close_notify(ssl);
         await_close_notify(ssl);
     }
+    if (need_ticket)
+        return fail_msg(EXIT_FAIL, ssl, "no session ticket received");
     return finish(EXIT_OK, ssl, true, NULL);
 }
 
@@ -584,28 +636,57 @@ static int handshake(SSL *ssl)
     return EXIT_OK;
 }
 
-static int run_client(SSL_CTX *ctx)
+/* Connects a new socket (UDP or TCP) to --host/--port; a new source port per connection. */
+static int connect_socket(void)
 {
-    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM }, *res, *ai;
+    int type = g_opts.tls ? SOCK_STREAM : SOCK_DGRAM, fd = -1, gai;
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = type }, *res, *ai;
+
+    if ((gai = getaddrinfo(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], &hints, &res)) != 0) {
+        fprintf(stderr, "resolving --host: %s\n", gai_strerror(gai));
+        return -1;
+    }
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, type, 0);
+        if (fd >= 0 && connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+            break;
+        if (fd >= 0)
+            close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd >= 0 && !set_nonblocking(fd)) {
+        close(fd);
+        fd = -1;
+    }
+    return fd;
+}
+
+/* Keeps the latest resumable session; BoringSSL reports TLS 1.3 tickets only through this. */
+static int new_session_cb(SSL *ssl, SSL_SESSION *session)
+{
+    (void)ssl;
+    if (!SSL_SESSION_is_resumable(session))
+        return 0;
+    SSL_SESSION_free(g_ticket);
+    g_ticket = session;
+    fprintf(stderr, "session ticket received\n");
+    return 1;
+}
+
+/* One client lifecycle on a new socket; offer is the session to resume, or NULL. */
+static int client_connection(SSL_CTX *ctx, SSL_SESSION *offer)
+{
     const char *share = g_opts.val[OPT_KEY_SHARE];
     uint16_t share_id;
     SSL *ssl;
-    int rc, gai;
+    int rc;
 
-    if ((gai = getaddrinfo(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], &hints, &res)) != 0)
-        return fail_msg(EXIT_FAIL, NULL, "resolving --host: %s", gai_strerror(gai));
-    for (ai = res; ai != NULL; ai = ai->ai_next) {
-        g_fd = socket(ai->ai_family, SOCK_DGRAM, 0);
-        if (g_fd >= 0 && connect(g_fd, ai->ai_addr, ai->ai_addrlen) == 0)
-            break;
-        if (g_fd >= 0)
-            close(g_fd);
-        g_fd = -1;
-    }
-    freeaddrinfo(res);
-    if (g_fd < 0 || !set_nonblocking(g_fd))
-        return fail_msg(EXIT_FAIL, NULL, "connecting UDP socket: %s", strerror(errno));
-
+    g_hrr = 0;
+    g_started = false;
+    if ((g_fd = connect_socket()) < 0)
+        return fail_msg(EXIT_FAIL, NULL, "connecting %s socket: %s", g_opts.tls ? "TCP" : "UDP",
+            strerror(errno));
     if ((ssl = new_connection(ctx)) == NULL)
         return fail_ssl(NULL, 0, "creating connection");
     SSL_set_connect_state(ssl);
@@ -615,12 +696,27 @@ static int run_client(SSL_CTX *ctx)
     if (strcmp(share, "default") != 0
         && !SSL_set1_client_key_shares(ssl, &share_id, group_id(share, &share_id) ? 1 : 0))
         return fail_ssl(ssl, 0, "SSL_set1_client_key_shares");
+    if (offer != NULL && !SSL_set_session(ssl, offer))
+        return fail_ssl(ssl, 0, "SSL_set_session");
 
     if ((rc = handshake(ssl)) != EXIT_OK)
         return rc;
     rc = echo_and_close(ssl, false);
     SSL_free(ssl);
+    close(g_fd);
     return rc;
+}
+
+static int run_client(SSL_CTX *ctx)
+{
+    int rc;
+
+    g_last = !g_opts.resume;
+    if ((rc = client_connection(ctx, NULL)) != EXIT_OK || !g_opts.resume)
+        return rc;
+    g_conn = 2;
+    g_last = true;
+    return client_connection(ctx, g_ticket);
 }
 
 /* Contract rule 1 ("key share first"): BoringSSL itself picks the first server group the client
@@ -656,16 +752,18 @@ static enum ssl_select_cert_result_t select_group_cb(const SSL_CLIENT_HELLO *ch)
 
 static int bind_server_socket(void)
 {
-    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM,
-        .ai_flags = AI_PASSIVE }, *res;
+    int type = g_opts.tls ? SOCK_STREAM : SOCK_DGRAM, fd, one = 1;
+    struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = type, .ai_flags = AI_PASSIVE },
+                    *res;
     struct sockaddr_storage addr;
     socklen_t len = sizeof(addr);
-    int fd;
 
     if (getaddrinfo(g_opts.val[OPT_HOST], g_opts.val[OPT_PORT], &hints, &res) != 0)
         return -1;
-    fd = socket(res->ai_family, SOCK_DGRAM, 0);
-    if (fd >= 0 && bind(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    fd = socket(res->ai_family, type, 0);
+    if (fd >= 0 && g_opts.tls)
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (fd >= 0 && (bind(fd, res->ai_addr, res->ai_addrlen) != 0 || (g_opts.tls && listen(fd, 4) != 0))) {
         close(fd);
         fd = -1;
     }
@@ -679,29 +777,45 @@ static int bind_server_socket(void)
     return fd;
 }
 
-static int run_server(SSL_CTX *ctx)
+/* BoringSSL has no DTLS listener: the first datagram from a new source starts a connection,
+ * and the unconnected socket then only exchanges datagrams with that peer. */
+static bool await_dtls_peer(int fd)
 {
-    struct sockaddr_storage peer;
-    socklen_t peer_len = sizeof(peer);
+    struct sockaddr_storage prev = g_peer, from;
+    socklen_t prev_len = g_peer_len, from_len;
+    struct pollfd p = { .fd = fd, .events = POLLIN };
     unsigned char byte;
+
+    for (;;) {
+        if (poll(&p, 1, -1) < 0 && errno != EINTR)
+            return false;
+        from_len = sizeof(from);
+        if (recvfrom(fd, &byte, 1, MSG_PEEK, (struct sockaddr *)&from, &from_len) < 0) {
+            if (errno == EAGAIN || errno == EINTR)
+                continue;
+            return false;
+        }
+        if (prev_len == 0 || from_len != prev_len || memcmp(&from, &prev, from_len) != 0)
+            break;
+        recv(fd, &byte, 1, 0);
+        fprintf(stderr, "<< ignored datagram from the previous connection's peer\n");
+    }
+    g_peer = from;
+    g_peer_len = from_len;
+    return true;
+}
+
+static int server_connection(SSL_CTX *ctx, int listen_fd)
+{
     SSL *ssl;
     int rc;
 
-    /* BoringSSL servers never put a cookie into an HRR (ssl/tls13_server.cc). */
-    if (g_opts.cookie)
-        return fail_msg(EXIT_UNSUPPORTED, NULL,
-            "BoringSSL servers have no stateless HRR cookie; --validate=cookie not possible");
-    if (SSL_CTX_use_certificate_chain_file(ctx, g_opts.val[OPT_CERT]) != 1
-        || SSL_CTX_use_PrivateKey_file(ctx, g_opts.val[OPT_KEY], SSL_FILETYPE_PEM) != 1
-        || SSL_CTX_check_private_key(ctx) != 1)
-        return fail_ssl(NULL, 0, "loading --cert/--key");
-    SSL_CTX_set_select_certificate_cb(ctx, select_group_cb);
-
-    if ((g_fd = bind_server_socket()) < 0)
-        return fail_msg(EXIT_FAIL, NULL, "binding UDP socket: %s", strerror(errno));
-    /* BoringSSL has no listener: serve the first peer on a socket connected to it. */
-    if (recvfrom(g_fd, &byte, 1, MSG_PEEK, (struct sockaddr *)&peer, &peer_len) < 0
-        || connect(g_fd, (struct sockaddr *)&peer, peer_len) != 0 || !set_nonblocking(g_fd))
+    g_hrr = 0;
+    g_started = false;
+    if (g_opts.tls) {
+        if ((g_fd = accept(listen_fd, NULL, NULL)) < 0 || !set_nonblocking(g_fd))
+            return fail_msg(EXIT_FAIL, NULL, "accepting TCP connection: %s", strerror(errno));
+    } else if (!await_dtls_peer(listen_fd))
         return fail_msg(EXIT_FAIL, NULL, "waiting for the first datagram: %s", strerror(errno));
     if ((ssl = new_connection(ctx)) == NULL)
         return fail_ssl(NULL, 0, "creating connection");
@@ -711,7 +825,40 @@ static int run_server(SSL_CTX *ctx)
         return rc;
     rc = echo_and_close(ssl, true);
     SSL_free(ssl);
+    if (g_opts.tls)
+        close(g_fd);
     return rc;
+}
+
+static int run_server(SSL_CTX *ctx)
+{
+    int listen_fd, rc;
+
+    /* BoringSSL servers never put a cookie into an HRR (ssl/tls13_server.cc). */
+    if (g_opts.cookie)
+        return fail_msg(EXIT_UNSUPPORTED, NULL,
+            "BoringSSL servers have no HRR cookie (do_send_hello_retry_request in "
+            "ssl/tls13_server.cc); --validate=cookie not possible");
+    if (SSL_CTX_use_certificate_chain_file(ctx, g_opts.val[OPT_CERT]) != 1
+        || SSL_CTX_use_PrivateKey_file(ctx, g_opts.val[OPT_KEY], SSL_FILETYPE_PEM) != 1
+        || SSL_CTX_check_private_key(ctx) != 1)
+        return fail_ssl(NULL, 0, "loading --cert/--key");
+    SSL_CTX_set_select_certificate_cb(ctx, select_group_cb);
+
+    if ((listen_fd = bind_server_socket()) < 0)
+        return fail_msg(EXIT_FAIL, NULL, "binding %s socket: %s", g_opts.tls ? "TCP" : "UDP",
+            strerror(errno));
+    if (!g_opts.tls) {
+        if (!set_nonblocking(listen_fd))
+            return fail_msg(EXIT_FAIL, NULL, "socket: %s", strerror(errno));
+        g_fd = listen_fd;
+    }
+    g_last = !g_opts.resume;
+    if ((rc = server_connection(ctx, listen_fd)) != EXIT_OK || !g_opts.resume)
+        return rc;
+    g_conn = 2;
+    g_last = true;
+    return server_connection(ctx, listen_fd);
 }
 
 /* Rejects groups this build lacks (exit 2) and sets the group list in --groups order. */
@@ -751,10 +898,11 @@ static int usage(const char *fmt, const char *arg)
     snprintf(msg, sizeof(msg), fmt, arg);
     fprintf(stderr,
         "usage: run --role=client --variant=default --host=HOST --port=PORT\n"
-        "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --key-share=GROUP|empty|default\n"
+        "           --groups=G1[,G2...] --transport=dtls|tls --resume=off|ticket\n"
+        "           --mtu=N|default --ca=FILE --key-share=GROUP|empty|default\n"
         "       run --role=server --variant=default --host=HOST --port=PORT\n"
-        "           --groups=G1[,G2...] --mtu=N|default --ca=FILE --validate=off|cookie\n"
-        "           --cert=FILE --key=FILE\n");
+        "           --groups=G1[,G2...] --transport=dtls|tls --resume=off|ticket\n"
+        "           --mtu=N|default --ca=FILE --validate=off|cookie --cert=FILE --key=FILE\n");
     return fail_msg(EXIT_USAGE, NULL, "usage: %s", msg);
 }
 
@@ -789,6 +937,20 @@ static int parse_options(int argc, char **argv)
     long port;
     int c;
 
+    /* getopt_long accepts unambiguous abbreviations; the contract wants exact names. */
+    for (int i = 1; i < argc; i++) {
+        size_t len = strcspn(argv[i] + 2, "=");
+        bool known = false;
+
+        if (strncmp(argv[i], "--", 2) != 0)
+            continue;
+        for (int k = 0; k < OPT_COUNT && !known; k++)
+            known = strlen(LONGOPTS[k].name) == len && strncmp(LONGOPTS[k].name, argv[i] + 2, len) == 0;
+        if (!known)
+            return usage("unknown option %s", argv[i]);
+        if (argv[i][2 + len] == '\0')
+            i++; /* "--opt value": skip the value */
+    }
     opterr = 0;
     while ((c = getopt_long(argc, argv, "", LONGOPTS, NULL)) != -1) {
         if (c < 0 || c >= OPT_COUNT)
@@ -835,6 +997,16 @@ static int parse_options(int argc, char **argv)
         if (g_opts.val[i] != NULL && *g_opts.val[i] == '\0')
             return usage("--%s must not be empty", LONGOPTS[i].name);
     }
+    v = g_opts.val[OPT_TRANSPORT];
+    if (strcmp(v, "dtls") != 0 && strcmp(v, "tls") != 0)
+        return usage("--transport must be dtls or tls", NULL);
+    g_opts.tls = strcmp(v, "tls") == 0;
+    v = g_opts.val[OPT_RESUME];
+    if (strcmp(v, "off") != 0 && strcmp(v, "ticket") != 0)
+        return usage("--resume must be off or ticket", NULL);
+    g_opts.resume = strcmp(v, "ticket") == 0;
+    if (g_opts.tls && g_opts.payload != 0)
+        return usage("--mtu=%s: only default is valid with --transport=tls", g_opts.val[OPT_MTU]);
     if (g_opts.server) {
         v = g_opts.val[OPT_VALIDATE];
         if (strcmp(v, "off") != 0 && strcmp(v, "cookie") != 0)
@@ -856,19 +1028,25 @@ int main(int argc, char **argv)
 
     if ((rc = parse_options(argc, argv)) != EXIT_OK)
         return rc;
-    fprintf(stderr, "BoringSSL %s (API %d), role=%s variant=%s groups=%s mtu=%s key-share=%s "
-        "validate=%s\n", BSSL_COMMIT, BORINGSSL_API_VERSION, g_opts.val[OPT_ROLE],
-        g_opts.val[OPT_VARIANT], g_opts.val[OPT_GROUPS], g_opts.val[OPT_MTU],
+    g_conn = g_opts.resume ? 1 : 0;
+    fprintf(stderr, "BoringSSL %s (API %d), role=%s variant=%s transport=%s resume=%s groups=%s "
+        "mtu=%s key-share=%s validate=%s\n", BSSL_COMMIT, BORINGSSL_API_VERSION,
+        g_opts.val[OPT_ROLE], g_opts.val[OPT_VARIANT], g_opts.val[OPT_TRANSPORT],
+        g_opts.val[OPT_RESUME], g_opts.val[OPT_GROUPS], g_opts.val[OPT_MTU],
         g_opts.server ? "-" : g_opts.val[OPT_KEY_SHARE],
         g_opts.server ? g_opts.val[OPT_VALIDATE] : "-");
     if (g_opts.payload != 0 && g_opts.payload < BSSL_MIN_PAYLOAD)
         return fail_msg(EXIT_UNSUPPORTED, NULL, "--mtu=%ld rejected by SSL_set_mtu(%ld)",
             g_opts.mtu, g_opts.payload);
 
-    ctx = SSL_CTX_new(DTLS_method());
-    if (ctx == NULL || !SSL_CTX_set_min_proto_version(ctx, DTLS1_3_VERSION)
-        || !SSL_CTX_set_max_proto_version(ctx, DTLS1_3_VERSION))
-        return fail_ssl(NULL, 0, "creating DTLS 1.3 context");
+    {
+        uint16_t version = g_opts.tls ? TLS1_3_VERSION : DTLS1_3_VERSION;
+
+        ctx = SSL_CTX_new(g_opts.tls ? TLS_method() : DTLS_method());
+        if (ctx == NULL || !SSL_CTX_set_min_proto_version(ctx, version)
+            || !SSL_CTX_set_max_proto_version(ctx, version))
+            return fail_ssl(NULL, 0, "creating the 1.3 context");
+    }
     SSL_CTX_set_msg_callback(ctx, msg_cb);
     if ((rc = configure_groups(ctx)) != EXIT_OK)
         return rc;
@@ -877,6 +1055,10 @@ int main(int argc, char **argv)
         SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
         if (!SSL_CTX_load_verify_locations(ctx, g_opts.val[OPT_CA], NULL))
             return fail_ssl(NULL, 0, "loading --ca");
+        if (g_opts.resume) {
+            SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL);
+            SSL_CTX_sess_set_new_cb(ctx, new_session_cb);
+        }
     }
 
     rc = g_opts.server ? run_server(ctx) : run_client(ctx);

@@ -9,7 +9,8 @@ The library is rebuilt only when the commit or the CMake flags change; `adapter.
 No extra apt packages are needed: `git`, `cmake` and a C/C++ compiler are on the stock `ubuntu-24.04` runner.
 
 The `bssl` tool has no DTLS mode, so the adapter is a small C program on libssl.
-Both roles pin the protocol to DTLS 1.3 (`SSL_CTX_set_min/max_proto_version(DTLS1_3_VERSION)` on `DTLS_method()`).
+Both roles pin the protocol to version 1.3: `DTLS1_3_VERSION` on `DTLS_method()`, or `TLS1_3_VERSION` on `TLS_method()` with `--transport=tls`.
+`transports` declares `dtls` and `tls`.
 
 ## Variants
 
@@ -19,8 +20,11 @@ Only `--variant=default` is accepted; anything else exits 64.
 
 ## Transport
 
-The adapter supplies its own `BIO_METHOD` that calls `send`/`recv` on a connected, non-blocking UDP socket and logs every datagram.
-The server waits for the first datagram with `recvfrom(MSG_PEEK)`, `connect`s the socket to that peer and runs `SSL_accept`.
+The adapter supplies its own `BIO_METHOD` on a non-blocking socket and logs every datagram (`>> datagram (N bytes)`) or TCP write/read (`>> tcp (N bytes)`).
+The DTLS client uses a connected UDP socket.
+The DTLS server waits for the first datagram from a new source (`recvfrom(MSG_PEEK)`), then exchanges datagrams with that peer only (`sendto`/`recvfrom`, other sources are logged and ignored) and runs `SSL_accept`.
+Its socket stays unconnected, so with `--resume=ticket` the second connection's first datagram, from a new source port, is never refused.
+With `--transport=tls` the server `listen`s, `accept`s one TCP connection per TLS connection and closes it after the teardown; the client connects a new TCP socket per connection.
 BoringSSL leaves DTLS timers to the caller: the adapter polls until `DTLSv1_get_timeout` expires and then calls `DTLSv1_handle_timeout` (first timeout 400 ms, doubling).
 A handshake that makes no progress for 60 s fails with exit 1.
 
@@ -28,22 +32,28 @@ A handshake that makes no progress for 60 s fails with exit 1.
 
 Every option of the role is required, accepted as `--opt=value` or `--opt value`.
 A missing, unknown, repeated or other-role option, a malformed value, a group listed twice and a `--key-share` group not in `--groups` exit 64.
+Option names must match exactly: `getopt_long` would accept an abbreviation such as `--group`, so the adapter first rejects any `--name` that is not a full option name.
 
 | Option | BoringSSL mapping |
 |---|---|
 | `--port` | Server: binds it (`0` = any free port) and prints the bound port in the ready line; client: connects to it |
+| `--transport dtls` / `tls` | `DTLS_method()` over UDP / `TLS_method()` over TCP |
+| `--resume off` | One connection |
+| `--resume ticket` | Client: `SSL_CTX_set_session_cache_mode(SSL_SESS_CACHE_CLIENT \| SSL_SESS_CACHE_NO_INTERNAL)` and `SSL_CTX_sess_set_new_cb` keep the latest resumable session from a NewSessionTicket; connection 2 offers it with `SSL_set_session`. Server: serves two connections from one `SSL_CTX`, which issues tickets by default (two per handshake) |
 | `--groups` | IANA names mapped to code points, then `SSL_CTX_set1_group_ids`; the supported_groups order on the client, the preference order on the server |
 | `--key-share GROUP` | `SSL_set1_client_key_shares(ssl, &id, 1)` |
 | `--key-share empty` | `SSL_set1_client_key_shares(ssl, NULL, 0)`, the documented way to send an empty key_share |
 | `--key-share default` | No call: BoringSSL shares the first group plus the first later group of the other kind, post-quantum or classical (`ssl/extensions.cc`) |
 | `--mtu N` | `SSL_set_options(SSL_OP_NO_QUERY_MTU)` and `SSL_set_mtu(ssl, N - 48)`; see below |
-| `--mtu default` | No call, see below |
+| `--mtu default` | No call, see below; the only valid value with `--transport=tls` |
 | `--validate off` | Nothing to do: a BoringSSL server never validates addresses |
 | `--validate cookie` | Unsupported, exit 2 (see below) |
 | `--cert`, `--key` | `SSL_CTX_use_certificate_chain_file`, `SSL_CTX_use_PrivateKey_file` (PEM) |
 | `--ca` | Client: `SSL_CTX_load_verify_locations`, `SSL_VERIFY_PEER`, `SSL_set1_host("localhost")` and SNI `localhost`; the server accepts it but does not load it |
 
-The result line takes `version` from `SSL_get_version` and `group` from `SSL_get_group_id`, mapped back to the IANA name.
+The result line takes `version` from `SSL_get_version`, `group` from `SSL_get_group_id`, mapped back to the IANA name, and `resumed` from `SSL_session_reused`.
+With `--resume=ticket` it describes the last connection attempted, and every error is prefixed `connection N: `.
+A client that has no resumable ticket when it has read `pong` on connection 1 fails with `connection 1: no session ticket received`.
 `hrr` is `SSL_used_hello_retry_request` or an observed HelloRetryRequest; `hrr_cookie` and `hrr_group` are parsed from the HelloRetryRequest in the message callback (`SSL_CTX_set_msg_callback`).
 
 ### Group selection
@@ -64,6 +74,7 @@ That is 20 bytes more than a 1500-byte IPv6 path allows.
 ### Teardown
 
 The client sends `close_notify` after the pong and waits up to 2 s for the server's; the server waits up to 2 s for the client's and then sends its own.
+With TLS the socket is closed afterwards.
 In DTLS, `SSL_shutdown` never waits for the peer's `close_notify` (`ssl/ssl_lib.cc`), so both waits read with `SSL_read` until `SSL_ERROR_ZERO_RETURN`.
 A missing `close_notify` costs the 2 s and does not fail the run.
 
@@ -74,8 +85,9 @@ The default supported groups are X25519MLKEM768, X25519, secp256r1 and secp384r1
 
 ## Unsupported (exit 2)
 
-- `--validate=cookie`: a BoringSSL server never sends a cookie; `do_send_hello_retry_request` in `ssl/tls13_server.cc` writes only supported_versions and key_share, and there is no API for stateless address validation.
+- `--validate=cookie`, with either transport: a BoringSSL server never sends a cookie; `do_send_hello_retry_request` in `ssl/tls13_server.cc` writes only supported_versions and key_share, and there is no API for stateless address validation.
 The adapter exits 2 before it prints the ready line.
+The conformance suite skips its cookie cases for a BoringSSL server; S04, S10 and T01 with a BoringSSL server are `unsupported`.
 BoringSSL clients do echo a cookie (`ssl/tls13_client.cc`).
 - `MLKEM512X25519`, `SecP256r1MLKEM768`, `SecP384r1MLKEM1024` and any other group BoringSSL does not implement (`SSL_get_group_name` returns NULL).
 - `--mtu` below 276.
@@ -95,3 +107,7 @@ BoringSSL writes the cookie extension after key_share (`kExtensions` in `ssl/ext
 The client retransmits until it gives up.
 Without the cookie, or against OpenSSL in either validation mode, the same client configuration succeeds.
 - A fragmented CH1 with an X25519MLKEM768 share (`--mtu=1280`) is dropped by the wolfSSL `default` server, as for every fragmenting client; the `accept-tls13` server variant accepts it with the cookie off.
+- PSK resumption works in both transports, also after a HelloRetryRequest: against an OpenSSL cookie server at `--mtu=1280` (S10) both connections fragment CH1 and CH2, CH2 carries cookie and PSK, and both sides report `resumed`.
+Against itself, without a cookie, a key share HelloRetryRequest in both connections makes the client recompute its binder over the HelloRetryRequest (RFC 9846 sec 4.3.11.2).
+- A BoringSSL TLS client echoes the cookie of an OpenSSL or wolfSSL TLS server (T01).
+- Against a wolfSSL server every scenario with a fragmented CH1 (S03, S04, S08, S09, S10 and their `+split` rows) times out, exactly as with an OpenSSL client: wolfSSL drops the fragmented CH1 (see `implementations/wolfssl/README.md`); the `accept-tls13` variant accepts it only with the cookie off.

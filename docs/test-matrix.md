@@ -8,7 +8,7 @@ Every scenario runs for every (client, server) pair, including same-implementati
 |---|---|---|---|
 | openssl | 4.1.0 (2026-10-23) | yes | Listener API validates addresses by default (HRR cookie) |
 | wolfssl | v5.9.4-stable | yes | Rejects fragmented CH1 by default (reported) |
-| boringssl | commit f3ba8e44 (2026-11-24) | yes | No releases; no HRR cookie on servers (S04 unsupported) |
+| boringssl | commit f3ba8e44 (2026-11-24) | yes | No releases; no HRR cookie on servers (S04, S08-S10, T01 unsupported); DTLS and TLS |
 | nss | pinned release (TBD) | yes | Used by Firefox / WebRTC |
 | mbedtls | 4.3.0 | no (upstream) | TLS 1.3 HRR scenarios only |
 
