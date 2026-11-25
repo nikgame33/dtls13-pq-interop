@@ -29,7 +29,7 @@ With ML-KEM and DTLS 1.3, configure also auto-enables `WOLFSSL_DTLS_CH_FRAG` (se
 | `--variant` | `default`, or a name from `variants` (see below). |
 | `--port 0` | Server only: binds an ephemeral port and reports it in the ready line. |
 | `--groups` | Each group is probed with `wolfSSL_UseSupportedCurve()`, then the list is set with `wolfSSL_set_groups()` in preference order. |
-| `--key-share GROUP` | `wolfSSL_UseKeyShare()` (client only). |
+| `--key-share GROUP` | `wolfSSL_UseKeyShare()` (client only); exit 2 if that share does not fit into CH1, see below. |
 | `--key-share empty` | `wolfSSL_NoKeyShares()` (client only). |
 | `--key-share default` | No call: wolfSSL offers a share for the first `--groups` entry. |
 | `--mtu N` | `wolfSSL_dtls_set_mtu(N - 48)`, see below. |
@@ -39,7 +39,7 @@ With ML-KEM and DTLS 1.3, configure also auto-enables `WOLFSSL_DTLS_CH_FRAG` (se
 | `--cert`, `--key` | `wolfSSL_CTX_use_certificate_chain_file()`, `wolfSSL_CTX_use_PrivateKey_file()` (PEM). |
 | `--ca` | Client: `wolfSSL_CTX_load_verify_locations()` with `WOLFSSL_VERIFY_PEER` and a hostname check for `localhost` via `wolfSSL_check_domain_name()`. The server accepts it but does not load it, since there is no client authentication. |
 
-Both `--opt=value` and `--opt value` are accepted.
+Both `--opt=value` and `--opt value` are accepted; option names must match exactly (no abbreviations) and values must not be empty.
 Every option of a role is required.
 A missing, repeated or unknown option, an option of the other role, a variant not listed for the role or a malformed value is a usage error with exit code 64, and so is a `--key-share` group that is not in `--groups`.
 The adapter never forks or daemonizes; the server serves one client and exits.
@@ -86,9 +86,12 @@ PSK options are not part of the contract and are rejected as unknown options (ex
 These findings are covered by `tests/impl/test_wolfssl.py` (strict xfails mark the cases that do not work).
 
 - The wolfSSL client never fragments CH1.
-If CH1 with the requested key share does not fit into the MTU, it sends an empty `key_share` instead and lets the server answer with a HelloRetryRequest (`src/tls13.c`, debug message "Sending empty key share so we don't fragment CH1").
-At `--mtu=1280` the 1403-byte X25519MLKEM768 CH1 does not fit, so that handshake always has `hrr: true`; CH2 is then fragmented, which works.
-With `--mtu=default` the same happens, because the default 1400-byte limit is 3 bytes short of that CH1, so a default wolfSSL client never sends an X25519MLKEM768 share in CH1.
+If CH1 with the requested key share does not fit into the MTU, it sends an empty `key_share` instead and lets the server answer with a HelloRetryRequest (`src/tls13.c`, `SendTls13ClientHello`, debug message "Sending empty key share so we don't fragment CH1").
+There is no runtime switch for this (`WOLFSSL_DTLS_CH_FRAG` is compile-time).
+With `--key-share=GROUP` that breaks the contract, so the send callback refuses such a CH1 before it leaves the process and the client exits 2 ("unsupported"); nothing reaches the server.
+With `--key-share=default` the substitution is the library's choice and is kept.
+At `--mtu=1280` the 1403-byte X25519MLKEM768 CH1 does not fit, so a default-share handshake always has `hrr: true`; CH2 is then fragmented, which works.
+With `--mtu=default` the same happens, because the default 1400-byte limit is 3 bytes short of that CH1, so a wolfSSL client never sends an X25519MLKEM768 share in CH1.
 - The wolfSSL server with the cookie on (the default) silently drops a fragmented CH1, because the first fragment carries no cookie (`src/dtls13.c`, `DoClientHelloStateless`, "Cookie probably missing from first fragment. Dropping.").
 The peer then times out.
 - With `--validate off` the server still drops a fragmented CH1 when it runs `wolfSSL_accept()`, because that entry point does not mark the connection stateful when the cookie is off; `wolfSSL_accept_TLSv13()` does, and then reassembles the fragmented CH1 fine.

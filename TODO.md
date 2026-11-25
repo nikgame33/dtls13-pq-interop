@@ -18,18 +18,18 @@ Mark done with `[x]` and add the commit or PR reference.
 - [x] Impairment rules on parsed records: reorder CH1 fragments, drop the first CH1 fragment once (PR #1)
 - [x] E2E tests for the proxy with real UDP sockets (no mocks): PMTU drop, reorder, drop-once, trace content (PR #1)
 - [x] Proxy rule that splits an unfragmented CH1 into fragments (wolfSSL clients never fragment CH1) (PR #1)
-- [ ] Runner: start server adapter, wait for readiness, start client, enforce timeout, collect exit code, JSON line, logs, trace
-- [ ] Result schema (JSON per run) and a results directory layout keyed by date, implementation versions and scenario
+- [x] Runner: start server adapter, wait for readiness, start client, enforce timeout, collect exit code, JSON line, logs, trace (PR #3)
+- [x] Result schema (JSON per run) and a results directory layout keyed by date, implementation versions and scenario (PR #3)
 - [x] Test PKI generation (ECDSA P-256 CA + leaf), fresh per test session
 
-- [ ] Conformance suite `tests/conformance/`: every rule of docs/shim-interface.md against every built implementation and variant (ADR 0002)
+- [x] Conformance suite `tests/conformance/`: every rule of docs/shim-interface.md against every built implementation and variant (ADR 0002) (PR #9)
 
 ## Phase 2: Implementations
 
 Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/shim-interface.md, self-interop of S01 passing.
 
-- [ ] OpenSSL 4.1.0: decide between `openssl s_client`/`s_server` and a small C adapter on the listener API (`SSL_new_listener`, validation on by default)
-- [ ] wolfSSL v5.9.4-stable: configure flags for DTLS 1.3 + ML-KEM hybrids; find the option that allows fragmented CH1
+- [x] OpenSSL 4.1.0: C adapter on the listener API, `accept` server variant (PR #4)
+- [x] wolfSSL v5.9.4-stable: DTLS 1.3 + ML-KEM hybrids; client never fragments CH1, server reassembles it only in the `accept-tls13` variant without cookie (PR #5)
 - [ ] BoringSSL: pin a commit; small C/C++ adapter (bssl tool has no DTLS)
 - [ ] NSS: pin a release; check `tstclnt`/`selfserv` DTLS 1.3 + group options, otherwise a small adapter
 - [ ] mbedTLS 4.3.0: TLS 1.3 only, for T01 (HRR cookie echo); confirm DTLS 1.3 is really absent upstream
@@ -61,5 +61,5 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 ## Open questions
 
 - [ ] Ask John Mattsson for the CipherSnake configurations behind his findings, so we test the same settings
-- [ ] Include GnuTLS? (check DTLS 1.3 status)
+- [x] Include GnuTLS? (check DTLS 1.3 status) - no, not in 3.8.14 or master, see [library survey](docs/research/library-survey.md#gnutls)
 - [ ] Which BoringSSL commit and NSS release to pin (latest at time of Phase 2)

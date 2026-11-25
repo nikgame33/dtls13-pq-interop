@@ -3,7 +3,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <getopt.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdarg.h>
@@ -38,19 +37,10 @@ enum { HRR_SEEN = 1, HRR_COOKIE = 2, HRR_GROUP = 4 };
 enum { OPT_ROLE, OPT_VARIANT, OPT_HOST, OPT_PORT, OPT_GROUPS, OPT_MTU, OPT_CA, OPT_KEY_SHARE,
     OPT_VALIDATE, OPT_CERT, OPT_KEY, OPT_COUNT };
 
-static const struct option LONGOPTS[] = {
-    { "role", required_argument, NULL, OPT_ROLE },
-    { "variant", required_argument, NULL, OPT_VARIANT },
-    { "host", required_argument, NULL, OPT_HOST },
-    { "port", required_argument, NULL, OPT_PORT },
-    { "groups", required_argument, NULL, OPT_GROUPS },
-    { "mtu", required_argument, NULL, OPT_MTU },
-    { "ca", required_argument, NULL, OPT_CA },
-    { "key-share", required_argument, NULL, OPT_KEY_SHARE },
-    { "validate", required_argument, NULL, OPT_VALIDATE },
-    { "cert", required_argument, NULL, OPT_CERT },
-    { "key", required_argument, NULL, OPT_KEY },
-    { NULL, 0, NULL, 0 },
+static const char *const OPT_NAMES[OPT_COUNT] = {
+    [OPT_ROLE] = "role", [OPT_VARIANT] = "variant", [OPT_HOST] = "host", [OPT_PORT] = "port",
+    [OPT_GROUPS] = "groups", [OPT_MTU] = "mtu", [OPT_CA] = "ca", [OPT_KEY_SHARE] = "key-share",
+    [OPT_VALIDATE] = "validate", [OPT_CERT] = "cert", [OPT_KEY] = "key",
 };
 
 static const bool CLIENT_OPT[OPT_COUNT] = {
@@ -661,25 +651,34 @@ static int parse_options(int argc, char **argv)
     long port;
     int c;
 
-    opterr = 0;
-    while ((c = getopt_long(argc, argv, "", LONGOPTS, NULL)) != -1) {
-        if (c < 0 || c >= OPT_COUNT)
-            return usage("unknown option or missing value: %s", argv[optind - 1]);
+    /* Exact names only: getopt_long would also accept abbreviations such as --group. */
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i], *eq = strchr(arg, '=');
+        size_t len;
+
+        if (strncmp(arg, "--", 2) != 0)
+            return usage("unexpected argument %s", arg);
+        len = (eq != NULL ? (size_t)(eq - arg) : strlen(arg)) - 2;
+        for (c = 0; c < OPT_COUNT; c++)
+            if (strlen(OPT_NAMES[c]) == len && strncmp(arg + 2, OPT_NAMES[c], len) == 0)
+                break;
+        if (c == OPT_COUNT)
+            return usage("unknown option %s", arg);
+        if (eq == NULL && i + 1 == argc)
+            return usage("missing value for %s", arg);
         if (g_opts.val[c] != NULL)
-            return usage("--%s given twice", LONGOPTS[c].name);
-        g_opts.val[c] = optarg;
+            return usage("--%s given twice", OPT_NAMES[c]);
+        g_opts.val[c] = eq != NULL ? eq + 1 : argv[++i];
     }
-    if (optind != argc)
-        return usage("unexpected argument %s", argv[optind]);
     if ((v = g_opts.val[OPT_ROLE]) == NULL || (strcmp(v, "client") != 0 && strcmp(v, "server") != 0))
         return usage("--role must be client or server", NULL);
     g_opts.server = strcmp(v, "server") == 0;
     allowed = g_opts.server ? SERVER_OPT : CLIENT_OPT;
     for (int i = 0; i < OPT_COUNT; i++) {
         if (allowed[i] && g_opts.val[i] == NULL)
-            return usage("--%s is required", LONGOPTS[i].name);
+            return usage("--%s is required", OPT_NAMES[i]);
         if (!allowed[i] && g_opts.val[i] != NULL)
-            return usage("--%s is not an option of this role", LONGOPTS[i].name);
+            return usage("--%s is not an option of this role", OPT_NAMES[i]);
     }
 
     v = g_opts.val[OPT_VARIANT];
@@ -705,7 +704,7 @@ static int parse_options(int argc, char **argv)
     }
     for (int i = OPT_CA; i < OPT_COUNT; i++) {
         if (g_opts.val[i] != NULL && *g_opts.val[i] == '\0')
-            return usage("--%s must not be empty", LONGOPTS[i].name);
+            return usage("--%s must not be empty", OPT_NAMES[i]);
     }
     if (g_opts.server) {
         v = g_opts.val[OPT_VALIDATE];
