@@ -7,21 +7,33 @@ import shlex
 import sys
 from pathlib import Path
 
-from dtls_interop.implementations import VARIANTS_FILE, Implementation
+from dtls_interop.implementations import (
+    TRANSPORTS_FILE,
+    VARIANTS_FILE,
+    Implementation,
+    read_transports,
+)
 
 ECHO_ADAPTER = Path(__file__).parent / "fixtures" / "udp_echo" / "run"
 ECHO_VERSION = "udp-echo 1.0"
 
 
 def install(
-    root: Path, name: str, *flags: str, built: bool = True, variants: str | None = None
+    root: Path,
+    name: str,
+    *flags: str,
+    built: bool = True,
+    variants: str | None = None,
+    transports: str | None = "dtls\ntls\n",
 ) -> Implementation:
-    """Create <root>/implementations/<name>/ (with an optional variants file) and, if built,
-    <root>/build/<name>/.built. Returns the default-variant entry."""
+    """Create <root>/implementations/<name>/ (with optional variants and transports files) and,
+    if built, <root>/build/<name>/.built. Returns the default-variant entry."""
     impl_dir = root / "implementations" / name
     impl_dir.mkdir(parents=True)
     if variants is not None:
         (impl_dir / VARIANTS_FILE).write_text(variants)
+    if transports is not None:
+        (impl_dir / TRANSPORTS_FILE).write_text(transports)
     build_script = impl_dir / "build.sh"
     build_script.write_text("#!/bin/sh\nexit 0\n")
     adapter = impl_dir / "run"
@@ -34,7 +46,13 @@ def install(
     if built:
         prefix.mkdir(parents=True)
         (prefix / ".built").write_text(ECHO_VERSION + "\n")
-    return Implementation(name=name, adapter=adapter, build_script=build_script, prefix=prefix)
+    return Implementation(
+        name=name,
+        adapter=adapter,
+        build_script=build_script,
+        prefix=prefix,
+        transports=read_transports(impl_dir / TRANSPORTS_FILE),
+    )
 
 
 def child_pids() -> set[int]:

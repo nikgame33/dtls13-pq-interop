@@ -1,7 +1,8 @@
-"""Userspace UDP proxy between one client and one server on loopback (ADR 0001).
+"""Userspace UDP proxy between clients and one server on loopback (ADR 0001).
 
 Applies impairment rules on parsed DTLS records, then enforces the PMTU on every datagram it
-sends, and records each datagram in a trace.
+sends, and records each datagram in a trace. Each client source address is its own flow with
+its own upstream socket, so a second connection (ADR 0004) reaches the server from a new port.
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ class Datagram:
     action: Literal["forwarded", "dropped", "delayed", "replaced"]
     reason: str | None
     origin: int | None = None  # index of the replaced datagram this one was emitted for
+    flow: int = 0  # client source addresses numbered in order of their first datagram
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class Packet:
     payload: bytes
     parsed: ParsedDatagram
     origin: int | None = None
+    flow: int = 0
 
 
 @dataclass(frozen=True)
@@ -296,14 +299,22 @@ class _Held:
 
 
 @dataclass
+class _Flow:
+    index: int
+    client: tuple[str, int]
+    upstream: socket.socket
+
+
+@dataclass
 class _State:
-    client: tuple[str, int] | None = None
+    flows: dict[tuple[str, int], _Flow] = field(default_factory=dict)
+    by_index: list[_Flow] = field(default_factory=list)
     next_index: int = 0
     held: dict[int, _Held] = field(default_factory=dict)
 
 
 class UdpProxy:
-    """Forward datagrams between one client and ``server``; use as a context manager."""
+    """Forward datagrams between clients and ``server``; use as a context manager."""
 
     def __init__(
         self,
@@ -349,9 +360,6 @@ class UdpProxy:
         try:
             self._downstream = self._socket(socket.AF_INET)
             self._downstream.bind(("127.0.0.1", 0))
-            family = socket.AF_INET6 if ":" in self._server[0] else socket.AF_INET
-            self._upstream = self._socket(family)
-            self._upstream.connect(self._server)
             self._wake_r, self._wake_w = socket.socketpair()
             self._sockets += [self._wake_r, self._wake_w]
             for s in self._sockets:
@@ -407,27 +415,27 @@ class UdpProxy:
             action,
             reason,
             packet.origin,
+            packet.flow,
         )
         with self._cond:
             self._trace.append(entry)
             self._cond.notify_all()
 
     def _run(self) -> None:
-        sel = selectors.DefaultSelector()
+        self._sel = selectors.DefaultSelector()
         try:
-            sel.register(self._downstream, selectors.EVENT_READ, "c2s")
-            sel.register(self._upstream, selectors.EVENT_READ, "s2c")
-            sel.register(self._wake_r, selectors.EVENT_READ, None)
+            self._sel.register(self._downstream, selectors.EVENT_READ, None)
+            self._sel.register(self._wake_r, selectors.EVENT_READ, "wake")
             while True:
-                for key, _ in sel.select(self._select_timeout()):
-                    if key.data is None:
+                for key, _ in self._sel.select(self._select_timeout()):
+                    if key.data == "wake":
                         return
-                    self._drain(key.fileobj, key.data)
+                    self._drain(key.fileobj, key.data)  # type: ignore[arg-type]
                 self._release_due()
         except BaseException as exc:
             self._error = exc
         finally:
-            sel.close()
+            self._sel.close()
 
     def _select_timeout(self) -> float | None:
         deadlines = [d for r in self._rules if (d := r.deadline()) is not None]
@@ -435,7 +443,8 @@ class UdpProxy:
             return None
         return max(0.0, min(deadlines) - self._now())
 
-    def _drain(self, sock: socket.socket, direction: Direction) -> None:
+    def _drain(self, sock: socket.socket, flow: _Flow | None) -> None:
+        """Read from the downstream socket (``flow`` None) or from one flow's upstream socket."""
         while True:
             try:
                 payload, addr = sock.recvfrom(_MAX_UDP)
@@ -443,28 +452,32 @@ class UdpProxy:
                 return
             except OSError:
                 continue  # e.g. ICMP port unreachable from a server that is not up yet
-            self._receive(payload, addr, direction)
+            if flow is None:
+                self._apply(self._packet(payload, "c2s", None, self._flow(addr).index), 0, None)
+            else:
+                self._apply(self._packet(payload, "s2c", None, flow.index), 0, None)
             self._release_due()  # a hold may end with this datagram; release before the next one
 
-    def _receive(self, payload: bytes, addr: tuple[str, int], direction: Direction) -> None:
-        state = self._state
-        packet = self._packet(payload, direction, origin=None)
-        if direction == "c2s":
-            if state.client is None:
-                state.client = addr
-            elif addr != state.client:
-                self._record(packet, packet.received, "dropped", "unexpected source")
-                return
-        elif state.client is None:
-            self._record(packet, packet.received, "dropped", "no client yet")
-            return
-        self._apply(packet, 0, None)
+    def _flow(self, client: tuple[str, int]) -> _Flow:
+        flow = self._state.flows.get(client)
+        if flow is None:
+            family = socket.AF_INET6 if ":" in self._server[0] else socket.AF_INET
+            upstream = self._socket(family)
+            upstream.setblocking(False)
+            upstream.connect(self._server)
+            flow = _Flow(len(self._state.by_index), client, upstream)
+            self._state.flows[client] = flow
+            self._state.by_index.append(flow)
+            self._sel.register(upstream, selectors.EVENT_READ, flow)
+        return flow
 
-    def _packet(self, payload: bytes, direction: Direction, origin: int | None) -> Packet:
+    def _packet(
+        self, payload: bytes, direction: Direction, origin: int | None, flow: int
+    ) -> Packet:
         index = self._state.next_index
         self._state.next_index += 1
         parsed = parse_datagram(payload, cid_length=self._cid_length)
-        return Packet(index, self._now(), direction, payload, parsed, origin)
+        return Packet(index, self._now(), direction, payload, parsed, origin, flow)
 
     def _apply(self, packet: Packet, first_rule: int, held_reason: str | None) -> None:
         now = self._now()
@@ -479,7 +492,7 @@ class UdpProxy:
             if verdict.action == "replace":
                 self._record(packet, now, "replaced", verdict.reason)
                 for payload in verdict.payloads:
-                    emitted = self._packet(payload, packet.direction, origin=packet.index)
+                    emitted = self._packet(payload, packet.direction, packet.index, packet.flow)
                     self._apply(emitted, i + 1, None)
                 return
         self._send(packet, held_reason)
@@ -505,11 +518,12 @@ class UdpProxy:
         if held_reason is not None:
             action = "delayed"
             reason = f"{held_reason}; held {1000 * (now - packet.received):.1f} ms"
+        flow = self._state.by_index[packet.flow]
         try:
             if packet.direction == "c2s":
-                self._upstream.send(packet.payload)
-            elif self._state.client is not None:
-                self._downstream.sendto(packet.payload, self._state.client)
+                flow.upstream.send(packet.payload)
+            else:
+                self._downstream.sendto(packet.payload, flow.client)
         except OSError as exc:
             self._record(packet, now, "dropped", f"send: {exc}")
             return

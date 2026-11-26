@@ -64,6 +64,9 @@ def summarize(trace: Sequence[object]) -> TraceSummary:
     entries = [d for d in trace if isinstance(d, Datagram)]
     # Datagrams the proxy emitted for a replaced one have an origin; the client sent the rest.
     sent = [d for d in entries if d.direction == "c2s" and d.origin is None]
+    # With --resume=ticket each connection is a flow; like the result lines, describe the last.
+    last = max((d.flow for d in sent), default=0)
+    sent = [d for d in sent if d.flow == last]
     hellos = [
         f
         for d in sent

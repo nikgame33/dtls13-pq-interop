@@ -4,7 +4,7 @@ import pytest
 from echo_adapter import install
 
 from dtls_interop import implementations
-from dtls_interop.implementations import BOTH_ROLES, read_variants
+from dtls_interop.implementations import BOTH_ROLES, read_transports, read_variants
 
 
 def discover(root):
@@ -56,3 +56,39 @@ def test_malformed_variants_file(tmp_path, text, message):
 
 def test_missing_variants_file_means_none(tmp_path):
     assert read_variants(tmp_path / "variants") == []
+
+
+def test_transports_are_declared_per_implementation(tmp_path):
+    install(tmp_path, "both", variants="server alt: Alt\n", transports="dtls\ntls\n")
+    install(tmp_path, "legacy", transports=None)
+    install(tmp_path, "tlsonly", transports="tls\n")
+
+    found = {e.id: e.transports for e in discover(tmp_path)}
+
+    assert found == {
+        "both": {"dtls", "tls"},
+        "both+alt": {"dtls", "tls"},  # variants share the adapter, so its transports
+        "legacy": {"dtls"},
+        "tlsonly": {"tls"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("quic\n", "unknown or duplicate transport 'quic'"),
+        ("tls\ntls\n", "unknown or duplicate transport 'tls'"),
+        ("\n", "lists no transport"),
+    ],
+)
+def test_malformed_transports_file(tmp_path, text, message):
+    path = tmp_path / "transports"
+    path.write_text(text)
+
+    with pytest.raises(ValueError, match=message):
+        read_transports(path)
+
+
+def test_shipped_transports_files_are_valid():
+    for impl in implementations.discover():
+        assert impl.transports <= implementations.KNOWN_TRANSPORTS

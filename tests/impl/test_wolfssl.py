@@ -1,4 +1,4 @@
-"""wolfSSL adapter self-interop over real loopback UDP (no harness proxy yet)."""
+"""wolfSSL adapter self-interop over real loopback UDP and TCP (no harness proxy yet)."""
 
 from __future__ import annotations
 
@@ -6,11 +6,14 @@ import json
 import queue
 import re
 import selectors
+import signal
 import socket
+import ssl
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 
 import pytest
@@ -25,6 +28,18 @@ RUN_TIMEOUT = 20.0
 HANG_TIMEOUT = 8.0
 EXIT_UNSUPPORTED = 2
 EXIT_USAGE = 64
+# Contract order of the result line fields.
+RESULT_FIELDS = [
+    "event",
+    "ok",
+    "version",
+    "group",
+    "hrr",
+    "hrr_cookie",
+    "hrr_group",
+    "resumed",
+    "error",
+]
 
 
 @dataclass
@@ -81,10 +96,17 @@ def wolfssl(require_impl: Callable[[str], Implementation]) -> Implementation:
     return require_impl("wolfssl")
 
 
-def _base(wolfssl: Implementation, test_pki: pki.TestPki, role: str, variant: str) -> list[str]:
+def _base(
+    wolfssl: Implementation,
+    test_pki: pki.TestPki,
+    role: str,
+    variant: str,
+    transport: str = "dtls",
+    resume: str = "off",
+) -> list[str]:
     """Role-specific required options in the runner's --opt=value form."""
     cmd = [str(wolfssl.adapter), f"--role={role}", f"--variant={variant}", f"--host={HOST}"]
-    cmd.append(f"--ca={test_pki.ca_cert}")
+    cmd += [f"--transport={transport}", f"--resume={resume}", f"--ca={test_pki.ca_cert}"]
     if role == "server":
         cmd += [f"--cert={test_pki.server_cert}", f"--key={test_pki.server_key}"]
     return cmd
@@ -99,10 +121,13 @@ def run_pair(wolfssl: Implementation, test_pki: pki.TestPki) -> Callable[..., Pa
         via: Callable[[int], AbstractContextManager[int]] | None = None,
         timeout: float = RUN_TIMEOUT,
         variant: str = "default",
+        transport: str = "dtls",
+        resume: str = "off",
     ) -> PairOutcome:
         # The only wolfSSL variant is server-only, so the client always runs "default".
+        server_cmd = _base(wolfssl, test_pki, "server", variant, transport, resume)
         server = subprocess.Popen(
-            [*_base(wolfssl, test_pki, "server", variant), "--port=0", *server_args],
+            [*server_cmd, "--port=0", *server_args],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -110,7 +135,7 @@ def run_pair(wolfssl: Implementation, test_pki: pki.TestPki) -> Callable[..., Pa
         try:
             port = _wait_ready(server)
             with (via or _direct)(port) as client_port:
-                client_cmd = _base(wolfssl, test_pki, "client", "default")
+                client_cmd = _base(wolfssl, test_pki, "client", "default", transport, resume)
                 client = subprocess.Popen(
                     [*client_cmd, f"--port={client_port}", *client_args],
                     stdout=subprocess.PIPE,
@@ -145,19 +170,23 @@ def _assert_ok(
     cookie: bool = False,
     hrr_group: bool = False,
     max_datagram: int | None = None,
+    version: str = "DTLSv1.3",
+    resumed: bool = False,
 ) -> None:
     for role, side in (("client", o.client), ("server", o.server)):
         assert side.rc == 0, f"{role} rc={side.rc} result={side.result}\n{side.stderr}"
         assert side.result == {
             "event": "result",
             "ok": True,
-            "version": "DTLSv1.3",
+            "version": version,
             "group": group,
             "hrr": hrr,
             "hrr_cookie": hrr and cookie,
             "hrr_group": hrr and hrr_group,
+            "resumed": resumed,
             "error": None,
         }, f"{role}: {side.stderr}"
+        assert list(side.result) == RESULT_FIELDS
         if max_datagram is not None:
             sizes = _tx_sizes(side.stderr)
             assert sizes and max(sizes) <= max_datagram, f"{role} sent {sizes}"
@@ -194,8 +223,26 @@ def test_x25519mlkem768_self_interop(run_pair, mtu: int, validate: str) -> None:
 
 @pytest.mark.parametrize("validate", ["off", "cookie"])
 def test_secp256r1mlkem768_self_interop(run_pair, validate: str) -> None:
-    o = run_pair(*_args("SecP256r1MLKEM768", 1500, validate))
-    _assert_ok(o, "SecP256r1MLKEM768", hrr=validate == "cookie", cookie=True, max_datagram=1452)
+    o = run_pair(*_args("SecP256r1MLKEM768", 1500, validate, key_share="default"))
+    # The 1443-byte CH1 (psk_key_exchange_modes added by session tickets) would fit in 1452, but
+    # wolfSSL compares the whole record with the plaintext limit 1439 and empties the key share.
+    _assert_ok(
+        o,
+        "SecP256r1MLKEM768",
+        hrr=True,
+        cookie=validate == "cookie",
+        hrr_group=True,
+        max_datagram=1452,
+    )
+    first_ch = re.search(r"tx \d+B \| rec=22 epoch=0 hs=1 .*", o.client.stderr)
+    assert first_ch is not None and "51:2()," in first_ch[0], o.client.stderr
+
+
+def test_requested_secp256r1mlkem768_share_at_1500_is_unsupported(run_pair) -> None:
+    # The same 13-byte-strict size check, so an explicit share is refused even at MTU 1500.
+    o = run_pair(*_args("SecP256r1MLKEM768", 1500, "off"), timeout=HANG_TIMEOUT)
+    assert o.client.rc == EXIT_UNSUPPORTED, o.client.stderr
+    assert o.client.result is not None and "empty key_share" in o.client.result["error"]
 
 
 @pytest.mark.parametrize("mtu", [1280, "default"])
@@ -211,7 +258,7 @@ def test_requested_share_that_does_not_fit_ch1_is_unsupported(run_pair, mtu) -> 
 
 def test_default_mtu_is_1400_and_too_small_for_x25519mlkem768_ch1(run_pair) -> None:
     o = run_pair(*_args("X25519MLKEM768", "default", "off", key_share="default"))
-    # WOLFSSL_MAX_MTU is 1400 and the X25519MLKEM768 CH1 is 1403 bytes, so the share is dropped.
+    # WOLFSSL_MAX_MTU is 1400 and the X25519MLKEM768 CH1 is 1410 bytes, so the share is dropped.
     _assert_ok(o, "X25519MLKEM768", hrr=True, hrr_group=True, max_datagram=1400)
     assert max(_tx_sizes(o.client.stderr)) == 1400, o.client.stderr
 
@@ -292,9 +339,10 @@ def test_variants_are_accepted_only_in_their_roles(
         assert rc == expected, f"{variant}: rc={rc}"
 
 
+_TRANSPORT_RESUME = ["--transport", "dtls", "--resume", "off"]
 _VALID = {
-    "client": ["--groups", "X25519", "--mtu", "1500", "--key-share", "X25519"],
-    "server": ["--groups", "X25519", "--mtu", "1500", "--validate", "off"],
+    "client": ["--groups", "X25519", "--mtu", "1500", "--key-share", "X25519", *_TRANSPORT_RESUME],
+    "server": ["--groups", "X25519", "--mtu", "1500", "--validate", "off", *_TRANSPORT_RESUME],
 }
 
 
@@ -328,6 +376,13 @@ def _without(args: list[str], option: str) -> list[str]:
         ("client", lambda a: [*_without(a, "--key-share"), "--key-share", "secp256r1"]),
         ("client", lambda a: [*_without(a, "--groups"), "--groups", "X25519,"]),
         ("client", lambda a: [*a, "--mtu", "1500"]),
+        ("client", lambda a: _without(a, "--transport")),
+        ("server", lambda a: _without(a, "--resume")),
+        ("server", lambda a: [*_without(a, "--transport"), "--transport", "quic"]),
+        ("client", lambda a: [*_without(a, "--resume"), "--resume", "psk"]),
+        ("client", lambda a: [*_without(a, "--transport"), "--transport", "tls"]),
+        ("server", lambda a: [*_without(a, "--transport"), "--transport", "tls"]),
+        ("client", lambda a: [*a, "--resume", "off"]),
     ],
     ids=[
         "missing-key-share",
@@ -343,6 +398,13 @@ def _without(args: list[str], option: str) -> list[str]:
         "key-share-not-in-groups",
         "empty-group-entry",
         "duplicate-option",
+        "missing-transport",
+        "missing-resume",
+        "bad-transport",
+        "bad-resume",
+        "client-tls-numeric-mtu",
+        "server-tls-numeric-mtu",
+        "duplicate-resume",
     ],
 )
 def test_usage_error_exits_64(
@@ -493,3 +555,217 @@ def test_relay_split_is_well_formed() -> None:
     assert parts is not None
     assert [int.from_bytes(p[5:11]) for p in parts] == [6, 7]
     assert b"".join(p[25:] for p in parts) == body
+
+
+# --- TLS 1.3 over TCP -------------------------------------------------------------------------
+
+
+def _tls_args(groups: str, validate: str, key_share: str | None = None) -> tuple:
+    return _args(groups, "default", validate, key_share)
+
+
+@pytest.mark.parametrize("validate", ["off", "cookie"])
+def test_tls_x25519_self_interop(run_pair, validate: str) -> None:
+    o = run_pair(*_tls_args("X25519", validate), transport="tls")
+    _assert_ok(o, "X25519", hrr=validate == "cookie", cookie=True, version="TLSv1.3")
+    assert "received the server's close_notify" in o.client.stderr, o.client.stderr
+    assert "received the client's close_notify" in o.server.stderr, o.server.stderr
+
+
+def test_tls_x25519mlkem768_sends_full_share_in_ch1(run_pair) -> None:
+    # The DTLS CH1 size check does not apply to TLS: the 1.2 kB share goes into CH1.
+    o = run_pair(*_tls_args("X25519MLKEM768", "off"), transport="tls")
+    _assert_ok(o, "X25519MLKEM768", hrr=False, version="TLSv1.3")
+    assert "51:1222(0x11ec)" in o.client.stderr, o.client.stderr
+
+
+@contextmanager
+def _tcp_trickle_relay(server_port: int) -> Iterator[int]:
+    """Forward TCP in small delayed chunks, so records reach each peer split across reads."""
+    listener = socket.create_server((HOST, 0))
+    stop = threading.Event()
+
+    def pump(src: socket.socket, dst: socket.socket) -> None:
+        while not stop.is_set():
+            try:
+                data = src.recv(64)
+            except OSError:
+                break
+            if not data:
+                break
+            for i in range(0, len(data), 7):
+                dst.sendall(data[i : i + 7])
+                time.sleep(0.0005)
+        with suppress(OSError):
+            dst.shutdown(socket.SHUT_WR)
+
+    def serve() -> None:
+        listener.settimeout(RUN_TIMEOUT)
+        try:
+            front, _ = listener.accept()
+        except OSError:
+            return
+        back = socket.create_connection((HOST, server_port))
+        for s in (front, back):
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        pumps = [threading.Thread(target=pump, args=p) for p in ((front, back), (back, front))]
+        for p in pumps:
+            p.start()
+        for p in pumps:
+            p.join()
+        front.close()
+        back.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        stop.set()
+        listener.close()
+        thread.join(timeout=5)
+
+
+def test_tls_hrr_detected_across_split_records(run_pair) -> None:
+    server = ["--groups=X25519MLKEM768,X25519", "--mtu=default", "--validate=cookie"]
+    client = ["--groups=X25519,X25519MLKEM768", "--mtu=default", "--key-share=empty"]
+    o = run_pair(server, client, via=_tcp_trickle_relay, transport="tls")
+    _assert_ok(o, "X25519MLKEM768", hrr=True, cookie=True, hrr_group=True, version="TLSv1.3")
+    assert re.search(r"rx record \d+B type=22 hs=2 len=\d+ exts=51:1124\(0x11ec\)", o.client.stderr)
+
+
+def test_dtls_only_variant_with_tls_exits_2(wolfssl: Implementation, test_pki: pki.TestPki) -> None:
+    cmd = [*_base(wolfssl, test_pki, "server", "accept-tls13", "tls"), "--port=0"]
+    rc, result = _run_once([*cmd, "--groups=X25519", "--mtu=default", "--validate=off"])
+    assert rc == EXIT_UNSUPPORTED
+    assert result is not None and list(result) == RESULT_FIELDS
+    assert result["ok"] is False and "DTLS-only" in result["error"]
+    assert result["resumed"] is None and result["hrr"] is None and result["version"] is None
+
+
+# --- Resumption with a session ticket -------------------------------------------------------
+
+
+def _assert_both_connections(o: PairOutcome) -> None:
+    for role, side in (("client", o.client), ("server", o.server)):
+        for n in (1, 2):
+            assert f"connection {n}: handshake done" in side.stderr, f"{role}: {side.stderr}"
+
+
+def test_dtls_resumption_s10(run_pair) -> None:
+    # S10 with the library's share choice: CH1 does not fit at MTU 1280, so both connections get
+    # an HRR with cookie and group. S10's explicit share exits 2 like any CH1 that does not fit.
+    o = run_pair(*_args("X25519MLKEM768", 1280, "cookie", key_share="default"), resume="ticket")
+    _assert_ok(
+        o,
+        "X25519MLKEM768",
+        hrr=True,
+        cookie=True,
+        hrr_group=True,
+        resumed=True,
+        max_datagram=1232,
+    )
+    _assert_both_connections(o)
+
+
+@pytest.mark.parametrize("validate", ["off", "cookie"])
+def test_dtls_x25519_resumption(run_pair, validate: str) -> None:
+    o = run_pair(*_args("X25519", 1500, validate), resume="ticket")
+    _assert_ok(o, "X25519", hrr=validate == "cookie", cookie=True, resumed=True)
+    _assert_both_connections(o)
+
+
+def test_dtls_resumption_pre_shared_key_makes_the_requested_share_unsupported(run_pair) -> None:
+    # Connection 1 sends the 1410-byte CH1; with pre_shared_key the CH1 of connection 2 is too big.
+    o = run_pair(*_args("X25519MLKEM768", 1500, "off"), resume="ticket", timeout=HANG_TIMEOUT)
+    assert o.client.rc == EXIT_UNSUPPORTED, o.client.stderr
+    assert o.client.result is not None
+    assert o.client.result["error"].startswith("connection 2: unsupported: CH1 with the")
+    assert "connection 1: handshake done" in o.client.stderr, o.client.stderr
+
+
+def test_dtls_resumption_pre_shared_key_pushes_pq_ch1_past_mtu(run_pair) -> None:
+    # The 1410-byte CH1 fits at MTU 1500; with the pre_shared_key extension it does not.
+    o = run_pair(*_args("X25519MLKEM768", 1500, "off", key_share="default"), resume="ticket")
+    _assert_ok(o, "X25519MLKEM768", hrr=True, hrr_group=True, resumed=True, max_datagram=1452)
+    first_ch = re.findall(r"tx \d+B \| rec=22 epoch=0 hs=1 seq=0 .*", o.client.stderr)
+    assert len(first_ch) == 2, o.client.stderr
+    assert "51:1222(0x11ec)" in first_ch[0] and "51:2()," in first_ch[1], o.client.stderr
+    assert "41:" in first_ch[1], o.client.stderr
+
+
+@pytest.mark.parametrize("validate", ["off", "cookie"])
+def test_tls_x25519_resumption(run_pair, validate: str) -> None:
+    o = run_pair(*_tls_args("X25519", validate), transport="tls", resume="ticket")
+    _assert_ok(o, "X25519", hrr=validate == "cookie", cookie=True, resumed=True, version="TLSv1.3")
+    _assert_both_connections(o)
+
+
+@contextmanager
+def _ticketless_tls_server(test_pki: pki.TestPki) -> Iterator[int]:
+    """A TLS 1.3 server (Python's OpenSSL) that issues no NewSessionTicket."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    ctx.num_tickets = 0
+    ctx.load_cert_chain(test_pki.server_cert, test_pki.server_key)
+    listener = socket.create_server((HOST, 0))
+    listener.settimeout(RUN_TIMEOUT)
+    errors: list[OSError] = []
+
+    def serve() -> None:
+        try:
+            conn, _ = listener.accept()
+            with ctx.wrap_socket(conn, server_side=True) as tls:
+                if tls.recv(4) == b"ping":
+                    tls.sendall(b"pong")
+                tls.unwrap()
+        except OSError as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+
+
+def test_client_without_ticket_fails_connection_1(
+    wolfssl: Implementation, test_pki: pki.TestPki
+) -> None:
+    with _ticketless_tls_server(test_pki) as port:
+        cmd = _base(wolfssl, test_pki, "client", "default", "tls", "ticket")
+        cmd += [f"--port={port}", "--groups=X25519", "--mtu=default", "--key-share=X25519"]
+        rc, result = _run_once(cmd)
+    assert rc == 1
+    assert result == {
+        "event": "result",
+        "ok": False,
+        "version": "TLSv1.3",
+        "group": "X25519",
+        "hrr": False,
+        "hrr_cookie": False,
+        "hrr_group": False,
+        "resumed": False,
+        "error": "connection 1: no session ticket received",
+    }
+
+
+@pytest.mark.parametrize(("transport", "resume"), [("dtls", "off"), ("tls", "ticket")])
+def test_deadline_result_line(
+    wolfssl: Implementation, test_pki: pki.TestPki, transport: str, resume: str
+) -> None:
+    # SIGALRM is what the 60 s safety net delivers; its handler builds the JSON by hand.
+    mtu = "1500" if transport == "dtls" else "default"
+    cmd = [*_base(wolfssl, test_pki, "server", "default", transport, resume), "--port=0"]
+    cmd += ["--groups=X25519", f"--mtu={mtu}", "--validate=off"]
+    server = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _wait_ready(server)
+    server.send_signal(signal.SIGALRM)
+    outcome = _finish(server, 5.0)
+    assert outcome.rc == 1, outcome.stderr
+    assert outcome.result is not None and list(outcome.result) == RESULT_FIELDS
+    assert outcome.result["ok"] is False and outcome.result["resumed"] is None
+    prefix = "connection 1: " if resume == "ticket" else ""
+    assert outcome.result["error"] == f"{prefix}timeout"

@@ -61,6 +61,10 @@ class Expected:
     hrr: bool | None = None
     hrr_cookie: bool | None = None
     hrr_group: bool | None = None
+    # The last connection's result lines report a PSK resumption (S10: connection 2).
+    resumed: bool | None = None
+    # The trace shows CH2 echoing the HRR cookie byte for byte (checked only with a trace).
+    cookie_echoed: bool | None = None
     # Checked against the CH1/CH2 the client sent, as the proxy trace shows them.
     ch1_fragmented: bool | None = None
     ch2_fragmented: bool | None = None
@@ -76,7 +80,7 @@ class Scenario:
     path: PathConditions
     expected: Expected
     transport: Transport = Transport.DTLS
-    # Two handshakes: the second resumes with the PSK from the first.
+    # Two connections: the second resumes with a ticket from the first (--resume=ticket).
     resumption: bool = False
 
 
@@ -109,7 +113,7 @@ def _cookie_frag(sid: str, description: str, impairments: tuple[Impairment, ...]
     )
 
 
-# Every scenario pins --mtu to its path PMTU and --key-share to the share the row names, so a
+# Every DTLS scenario pins --mtu to its path PMTU and --key-share to the share the row names, so a
 # row means the same configuration for every library; DEFAULT is for library-default rows.
 def _build() -> tuple[Scenario, ...]:
     return (
@@ -229,14 +233,17 @@ def _build() -> tuple[Scenario, ...]:
                 hrr=True,
                 hrr_cookie=True,
                 hrr_group=False,
+                resumed=True,
+                cookie_echoed=True,
             ),
             resumption=True,
         ),
         Scenario(
             id="T01",
             description="TLS 1.3 HRR cookie echo (incl. mbedtls)",
-            client=ClientOptions(groups=(X25519,), key_share=X25519, mtu=1500),
-            server=ServerOptions(groups=(X25519,), validate=Validate.COOKIE, mtu=1500),
+            # TCP has no datagram size to configure, so --mtu is "default" (docs/shim-interface.md).
+            client=ClientOptions(groups=(X25519,), key_share=X25519, mtu=DEFAULT),
+            server=ServerOptions(groups=(X25519,), validate=Validate.COOKIE, mtu=DEFAULT),
             path=PathConditions(pmtu=1500),
             expected=Expected(
                 summary="Cookie echoed in CH2",
@@ -245,6 +252,8 @@ def _build() -> tuple[Scenario, ...]:
                 hrr=True,
                 hrr_cookie=True,
                 hrr_group=False,
+                resumed=False,
+                cookie_echoed=True,
             ),
             transport=Transport.TLS,
         ),

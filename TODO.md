@@ -43,8 +43,8 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 - [ ] S07 MLKEM512X25519 at PMTU 1280: measure whether CH1 and CH2 really stay unfragmented with realistic extensions (SNI, ALPN, use_srtp for WebRTC-like profile)
 - [x] S08, S09 reordering and loss (PR #11)
 - [x] Run S03, S04, S08, S09 with wolfSSL clients through `SplitClientHello`, since they never fragment CH1 (PR #11, `<ID>+split` rows, ADR 0003)
-- [ ] S10 PSK resumption after HRR
-- [ ] T01 TLS 1.3 HRR cookie echo
+- [x] S10 PSK resumption after HRR (PR #13)
+- [ ] T01 TLS 1.3 HRR cookie echo: contract, runner, TCP proxy trace and OpenSSL/wolfSSL adapters done (PR #13); mbedTLS adapter pending
 
 ## Phase 4: Results and outreach
 

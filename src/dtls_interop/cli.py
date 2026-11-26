@@ -73,7 +73,8 @@ def _cmd_list(impls: list[Implementation]) -> int:
         if impl.variant_description:
             roles = "both" if impl.roles == BOTH_ROLES else "/".join(sorted(impl.roles))
             note = f"  {roles} variant: {impl.variant_description}"
-        print(f"  {impl.id:<{width}}  {state}{note}")
+        transports = ",".join(sorted(impl.transports))
+        print(f"  {impl.id:<{width}}  {transports:<8}  {state}{note}")
     print("Scenarios:")
     for s in scenarios.SCENARIOS:
         print(f"  {s.id}  {s.description}")

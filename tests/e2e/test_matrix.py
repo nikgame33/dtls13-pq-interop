@@ -146,3 +146,26 @@ def test_unsupported_cases_end_promptly(matrix):
     for key, case in cases.items():
         if case.outcome is Outcome.UNSUPPORTED:
             assert case.duration_s < 2.0, (key, case.duration_s)
+
+
+def test_resumption_and_tls_rows(matrix):
+    servers = ["openssl", "openssl+accept", "wolfssl"]
+    cases, run_dir = matrix(["S10", "T01"], ["openssl"], servers, f"--timeout={SHORT_TIMEOUT}")
+
+    assert {(k[0], k[2]): c.outcome for k, c in cases.items()} == {
+        ("S10", "openssl"): Outcome.PASS,
+        ("S10", "openssl+accept"): Outcome.PASS,
+        # wolfSSL servers drop a fragmented CH1 (implementations/wolfssl/README.md).
+        ("S10", "wolfssl"): Outcome.TIMEOUT,
+        ("T01", "openssl"): Outcome.PASS,
+        # The listener variant is DTLS only.
+        ("T01", "openssl+accept"): Outcome.UNSUPPORTED,
+        ("T01", "wolfssl"): Outcome.PASS,
+    }, {k: c.reason for k, c in cases.items()}
+    for (scenario, _, _), case in cases.items():
+        if case.outcome is not Outcome.PASS:
+            continue
+        assert case.cookie_echoed is True and case.path.proxied
+        flows = {d["flow"] for d in case_trace(run_dir, case)}
+        assert flows == ({0, 1} if scenario == "S10" else {0})
+        assert case.client.result["resumed"] is (scenario == "S10")

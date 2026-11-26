@@ -41,8 +41,8 @@ def test_list(impl_root, module):
 
     assert proc.returncode == 0, proc.stderr
     lines = proc.stdout.splitlines()
-    assert f"  echo-a        built ({ECHO_VERSION})" in lines
-    assert "  echo-unbuilt  not built" in lines
+    assert f"  echo-a        dtls,tls  built ({ECHO_VERSION})" in lines
+    assert "  echo-unbuilt  dtls,tls  not built" in lines
     assert "  S01  X25519, full share, PMTU 1500, no validation" in lines
     assert any(line.startswith("  T01  ") for line in lines)
     assert "  S08+split  S08, MTU 1500 on path and peers, proxy splits CH1 in two" in lines
@@ -149,9 +149,12 @@ def test_variants_are_listed_and_selectable(impl_root, tmp_path):
 
     assert listing.returncode == 0, listing.stderr
     lines = listing.stdout.splitlines()
-    assert f"  echo-v+alt    built ({ECHO_VERSION})  client variant: Alternative code path" in lines
-    assert f"  echo-v+slow   built ({ECHO_VERSION})  server variant: Slow path" in lines
-    assert f"  echo-v+x      built ({ECHO_VERSION})  both variant: Both" in lines
+    assert (
+        f"  echo-v+alt    dtls,tls  built ({ECHO_VERSION})  client variant: Alternative code path"
+        in lines
+    )
+    assert f"  echo-v+slow   dtls,tls  built ({ECHO_VERSION})  server variant: Slow path" in lines
+    assert f"  echo-v+x      dtls,tls  built ({ECHO_VERSION})  both variant: Both" in lines
 
     results = tmp_path / "results"
     proc = cli(

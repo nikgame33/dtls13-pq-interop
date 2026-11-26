@@ -4,6 +4,7 @@
 #include <wolfssl/wolfio.h>
 
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -25,8 +26,13 @@
 #define CLOSE_NOTIFY_WAIT_MS 2000
 #define SERVER_NAME "localhost"
 #define MAX_GROUPS 16
+#define GROUPS_BUF 512
 /* --mtu is the IP path MTU; IPv6 (40) + UDP (8) headers leave the datagram payload. */
 #define IP_UDP_OVERHEAD 48
+/* TLS 1.3 record payloads are at most 2^14 + 256 bytes (RFC 9846 sec 5.2). */
+#define TLS_RECORD_HEADER 5
+#define TLS_MAX_RECORD (16384 + 256)
+#define TLS_HS_HEADER 4
 #define EXT_COOKIE 44
 #define EXT_KEY_SHARE 51
 #define SEEN_COOKIE 1u
@@ -60,16 +66,21 @@ static const unsigned char HRR_RANDOM[32] = {
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 };
 
+/* Per-connection state of the result line; the SIGALRM handler reads it too. */
 static volatile sig_atomic_t g_hrr, g_hrr_cookie, g_hrr_group;
 /* Client --key-share=GROUP: its code point, and whether wolfSSL tried to send another CH1 share. */
 static unsigned g_want_share;
 static int g_share_replaced;
 /* HRR fields are unknown (null) until the handshake has started, e.g. on usage errors. */
 static volatile sig_atomic_t g_handshake_started;
-static int g_is_client;
+static volatile sig_atomic_t g_resumed = -1; /* -1: unknown (null) */
+/* 0 before the first connection; errors after that carry "connection N: " with --resume=ticket. */
+static volatile sig_atomic_t g_conn;
+static const char *volatile g_version, *volatile g_group;
+static int g_is_client, g_tls, g_ticket;
 
 struct options {
-    const char *role, *variant, *host, *port, *groups, *mtu, *ca;
+    const char *role, *variant, *host, *port, *groups, *transport, *resume, *mtu, *ca;
     const char *key_share, *validate, *cert, *key;
     int mtu_bytes; /* 0: --mtu=default */
 };
@@ -106,17 +117,26 @@ static void print_json_string(const char *s)
 }
 
 static const char *hrr_json(int v) { return g_handshake_started ? json_bool(v) : "null"; }
+static const char *resumed_json(void) { return g_resumed < 0 ? "null" : json_bool(g_resumed); }
 
-static void emit_result(int ok, const char *version, const char *group, const char *error)
+static const char *conn_prefix(void)
+{
+    if (!g_ticket || g_conn == 0)
+        return "";
+    return g_conn == 1 ? "connection 1: " : "connection 2: ";
+}
+
+/* Describes the current connection, i.e. the last one attempted. */
+static void emit_result(int ok, const char *error)
 {
     fputs("{\"event\": \"result\", \"ok\": ", stdout);
     fputs(json_bool(ok), stdout);
     fputs(", \"version\": ", stdout);
-    print_json_string(version);
+    print_json_string(g_version);
     fputs(", \"group\": ", stdout);
-    print_json_string(group);
-    printf(", \"hrr\": %s, \"hrr_cookie\": %s, \"hrr_group\": %s, \"error\": ", hrr_json(g_hrr),
-           hrr_json(g_hrr_cookie), hrr_json(g_hrr_group));
+    print_json_string(g_group);
+    printf(", \"hrr\": %s, \"hrr_cookie\": %s, \"hrr_group\": %s, \"resumed\": %s, \"error\": ",
+           hrr_json(g_hrr), hrr_json(g_hrr_cookie), hrr_json(g_hrr_group), resumed_json());
     print_json_string(error);
     fputs("}\n", stdout);
     fflush(stdout);
@@ -124,11 +144,11 @@ static void emit_result(int ok, const char *version, const char *group, const ch
 
 _Noreturn static void vfail(int code, const char *prefix, const char *fmt, va_list ap)
 {
-    char msg[256];
-    size_t n = (size_t)snprintf(msg, sizeof(msg), "%s", prefix);
+    char msg[320];
+    size_t n = (size_t)snprintf(msg, sizeof(msg), "%s%s", conn_prefix(), prefix);
     vsnprintf(msg + n, sizeof(msg) - n, fmt, ap);
     log_msg("%s", msg);
-    emit_result(0, NULL, NULL, msg);
+    emit_result(0, msg);
     exit(code);
 }
 
@@ -154,17 +174,37 @@ static void write_str(const char *s)
     (void)r;
 }
 
+/* The strings are library or table constants without characters that need JSON escaping. */
+static void write_json_name(const char *s)
+{
+    if (s == NULL) {
+        write_str("null");
+        return;
+    }
+    write_str("\"");
+    write_str(s);
+    write_str("\"");
+}
+
 static void on_deadline(int sig)
 {
     (void)sig;
     /* Async-signal-safe: write(2) of constant strings only. */
-    write_str("{\"event\": \"result\", \"ok\": false, \"version\": null, \"group\": null, \"hrr\": ");
+    write_str("{\"event\": \"result\", \"ok\": false, \"version\": ");
+    write_json_name(g_version);
+    write_str(", \"group\": ");
+    write_json_name(g_group);
+    write_str(", \"hrr\": ");
     write_str(hrr_json(g_hrr));
     write_str(", \"hrr_cookie\": ");
     write_str(hrr_json(g_hrr_cookie));
     write_str(", \"hrr_group\": ");
     write_str(hrr_json(g_hrr_group));
-    write_str(", \"error\": \"timeout\"}\n");
+    write_str(", \"resumed\": ");
+    write_str(resumed_json());
+    write_str(", \"error\": \"");
+    write_str(conn_prefix());
+    write_str("timeout\"}\n");
     _exit(EXIT_FAIL);
 }
 
@@ -180,9 +220,11 @@ static unsigned log_hello_exts(const unsigned char *p, unsigned n, unsigned msg_
         return 0;
     i += 1 + p[i]; /* legacy_session_id */
     if (msg_type == 1) {
-        if (i + 1 > n)
-            return 0;
-        i += 1 + p[i]; /* legacy_cookie */
+        if (!g_tls) {
+            if (i + 1 > n)
+                return 0;
+            i += 1 + p[i]; /* DTLS legacy_cookie */
+        }
         if (i + 2 > n)
             return 0;
         i += 2 + get16(p + i); /* cipher_suites */
@@ -220,6 +262,13 @@ static unsigned log_hello_exts(const unsigned char *p, unsigned n, unsigned msg_
     return seen;
 }
 
+static void record_hrr(unsigned seen)
+{
+    g_hrr = 1;
+    g_hrr_cookie = (seen & SEEN_COOKIE) != 0;
+    g_hrr_group = (seen & SEEN_KEY_SHARE) != 0;
+}
+
 /* Log the plaintext records of one datagram and record a HelloRetryRequest and its reasons. */
 static void inspect_datagram(const char *dir, const unsigned char *b, int n, int count_hrr)
 {
@@ -247,11 +296,8 @@ static void inspect_datagram(const char *dir, const unsigned char *b, int n, int
                 unsigned avail = body + len - (h + 12);
                 seen = log_hello_exts(b + h + 12, frag_len < avail ? frag_len : avail, b[h]);
             }
-            if (is_hrr && count_hrr) {
-                g_hrr = 1;
-                g_hrr_cookie = (seen & SEEN_COOKIE) != 0;
-                g_hrr_group = (seen & SEEN_KEY_SHARE) != 0;
-            }
+            if (is_hrr && count_hrr)
+                record_hrr(seen);
             h += 12 + frag_len;
         }
         off = (int)(body + len);
@@ -310,7 +356,94 @@ static int ch1_has_other_share(const unsigned char *b, int n)
     return 0;
 }
 
-static int recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
+/* TCP splits and coalesces records, so each direction reassembles records and handshake
+ * messages until the first encrypted record. */
+struct stream {
+    const char *dir;
+    unsigned char rec[TLS_RECORD_HEADER + TLS_MAX_RECORD];
+    size_t rec_len;
+    unsigned char hs[1 << 16];
+    size_t hs_len;
+    int done;
+};
+
+static struct stream g_rx = {.dir = "rx"}, g_tx = {.dir = "tx"};
+
+static void stream_reset(struct stream *s)
+{
+    s->rec_len = s->hs_len = 0;
+    s->done = 0;
+}
+
+static void inspect_hs_messages(struct stream *s, int count_hrr)
+{
+    size_t off = 0;
+    while (s->hs_len - off >= TLS_HS_HEADER) {
+        const unsigned char *m = s->hs + off;
+        unsigned len = get24(m + 1), seen = 0;
+        int is_hrr;
+        if (s->hs_len - off < TLS_HS_HEADER + len)
+            break;
+        is_hrr = m[0] == 2 && len >= 34 && memcmp(m + TLS_HS_HEADER + 2, HRR_RANDOM, 32) == 0;
+        fprintf(stderr, " hs=%u%s len=%u", m[0], is_hrr ? "(HRR)" : "", len);
+        if (m[0] == 1 || m[0] == 2)
+            seen = log_hello_exts(m + TLS_HS_HEADER, len, m[0]);
+        if (is_hrr && count_hrr)
+            record_hrr(seen);
+        off += TLS_HS_HEADER + len;
+    }
+    memmove(s->hs, s->hs + off, s->hs_len - off);
+    s->hs_len -= off;
+}
+
+static void inspect_record(struct stream *s, int count_hrr)
+{
+    unsigned type = s->rec[0], len = get16(s->rec + 3);
+    fprintf(stderr, "[wolfssl-adapter] %s record %uB type=%u", s->dir, TLS_RECORD_HEADER + len, type);
+    if (type == 23) {
+        fputs(" | ciphertext", stderr);
+        s->done = 1;
+    }
+    else if (type == 22) {
+        if (s->hs_len + len > sizeof(s->hs)) {
+            fputs(" | handshake message too large to inspect", stderr);
+            s->done = 1;
+        }
+        else {
+            memcpy(s->hs + s->hs_len, s->rec + TLS_RECORD_HEADER, len);
+            s->hs_len += len;
+            inspect_hs_messages(s, count_hrr);
+        }
+    }
+    fputc('\n', stderr);
+}
+
+static void inspect_stream(struct stream *s, const unsigned char *p, size_t n, int count_hrr)
+{
+    while (n > 0 && !s->done) {
+        size_t want = s->rec_len < TLS_RECORD_HEADER
+                          ? TLS_RECORD_HEADER - s->rec_len
+                          : TLS_RECORD_HEADER + get16(s->rec + 3) - s->rec_len;
+        size_t take = want < n ? want : n;
+        memcpy(s->rec + s->rec_len, p, take);
+        s->rec_len += take;
+        p += take;
+        n -= take;
+        if (s->rec_len < TLS_RECORD_HEADER)
+            continue;
+        if (get16(s->rec + 3) > TLS_MAX_RECORD) {
+            log_msg("%s: record length %u is not TLS, stopping inspection", s->dir,
+                    get16(s->rec + 3));
+            s->done = 1;
+        }
+        else if (s->rec_len == TLS_RECORD_HEADER + get16(s->rec + 3)) {
+            inspect_record(s, count_hrr);
+            s->rec_len = 0;
+        }
+    }
+}
+
+static int dtls_recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
 {
     int r = EmbedReceiveFrom(ssl, buf, sz, ctx);
     if (r > 0)
@@ -318,7 +451,7 @@ static int recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
     return r;
 }
 
-static int send_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
+static int dtls_send_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
 {
     int r;
     /* WOLFSSL_DTLS_CH_FRAG empties a CH1 key_share that does not fit the MTU (src/tls13.c). */
@@ -329,6 +462,22 @@ static int send_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
     r = EmbedSendTo(ssl, buf, sz, ctx);
     if (r > 0)
         inspect_datagram("tx", (const unsigned char *)buf, r, !g_is_client);
+    return r;
+}
+
+static int tls_recv_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
+{
+    int r = EmbedReceive(ssl, buf, sz, ctx);
+    if (r > 0)
+        inspect_stream(&g_rx, (const unsigned char *)buf, (size_t)r, g_is_client);
+    return r;
+}
+
+static int tls_send_cb(WOLFSSL *ssl, char *buf, int sz, void *ctx)
+{
+    int r = EmbedSend(ssl, buf, sz, ctx);
+    if (r > 0)
+        inspect_stream(&g_tx, (const unsigned char *)buf, (size_t)r, !g_is_client);
     return r;
 }
 
@@ -407,11 +556,13 @@ static void forbid(const char *value, const char *name, const char *role)
 
 static void parse_args(int argc, char **argv, struct options *o)
 {
-    static const char *const names[] = {"role", "variant", "host", "port", "groups", "mtu",
+    static const char *const names[] = {"role", "variant", "host", "port", "groups", "transport",
+                                        "resume", "mtu",
                                         "ca", "key-share", "validate", "cert", "key"};
-    const char **slots[] = {&o->role, &o->variant, &o->host, &o->port, &o->groups, &o->mtu,
+    const char **slots[] = {&o->role, &o->variant, &o->host, &o->port, &o->groups,
+                            &o->transport, &o->resume, &o->mtu,
                             &o->ca, &o->key_share, &o->validate, &o->cert, &o->key};
-    size_t i, c;
+    size_t i, c, n_groups;
     int a, known = 0;
 
     memset(o, 0, sizeof(*o));
@@ -444,6 +595,8 @@ static void parse_args(int argc, char **argv, struct options *o)
     require(o->host, "host");
     require(o->port, "port");
     require(o->groups, "groups");
+    require(o->transport, "transport");
+    require(o->resume, "resume");
     require(o->mtu, "mtu");
     require(o->ca, "ca");
     if (g_is_client) {
@@ -465,9 +618,24 @@ static void parse_args(int argc, char **argv, struct options *o)
     if (!known)
         usage_error("--variant=%s is not a %s variant of this adapter", o->variant, o->role);
     parse_long(o->port, "port", g_is_client ? 1 : 0, 65535);
-    if (strcmp(o->mtu, "default") != 0)
+    if (strcmp(o->transport, "dtls") != 0 && strcmp(o->transport, "tls") != 0)
+        usage_error("--transport=%s is not dtls|tls", o->transport);
+    g_tls = strcmp(o->transport, "tls") == 0;
+    if (strcmp(o->resume, "off") != 0 && strcmp(o->resume, "ticket") != 0)
+        usage_error("--resume=%s is not off|ticket", o->resume);
+    g_ticket = strcmp(o->resume, "ticket") == 0;
+    if (strcmp(o->mtu, "default") != 0) {
+        if (g_tls)
+            usage_error("--mtu=%s with --transport=tls: only \"default\" is valid", o->mtu);
         o->mtu_bytes = (int)parse_long(o->mtu, "mtu", IP_UDP_OVERHEAD + 1, 65535);
+    }
     list_contains(o->groups, ""); /* rejects empty entries */
+    if (strlen(o->groups) >= GROUPS_BUF)
+        usage_error("--groups too long");
+    for (i = 0, n_groups = 1; o->groups[i] != '\0'; i++)
+        n_groups += o->groups[i] == ',';
+    if (n_groups > MAX_GROUPS)
+        usage_error("too many groups");
     if (o->key_share != NULL && strcmp(o->key_share, "empty") != 0 &&
         strcmp(o->key_share, "default") != 0 && !list_contains(o->groups, o->key_share))
         usage_error("--key-share=%s is not in --groups", o->key_share);
@@ -479,17 +647,14 @@ static void parse_args(int argc, char **argv, struct options *o)
 static void apply_groups(WOLFSSL *ssl, const char *list)
 {
     int ids[MAX_GROUPS], n = 0;
-    char buf[512], *tok, *save = NULL;
+    char buf[GROUPS_BUF], *tok, *save = NULL;
 
-    if (strlen(list) >= sizeof(buf))
-        usage_error("--groups too long");
+    /* parse_args has checked the length and the number of entries. */
     strcpy(buf, list);
     for (tok = strtok_r(buf, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save)) {
         const struct group *g = find_group_by_iana(tok);
         if (g == NULL)
             fail(EXIT_UNSUPPORTED, "unsupported group: %s", tok);
-        if (n == MAX_GROUPS)
-            usage_error("too many groups");
         /* wolfSSL_set_groups rejects the whole list, so probe each group for a precise error. */
         if (wolfSSL_UseSupportedCurve(ssl, (word16)g->id) != WOLFSSL_SUCCESS)
             fail(EXIT_UNSUPPORTED, "unsupported group in this build: %s", tok);
@@ -519,16 +684,15 @@ static void apply_key_share(WOLFSSL *ssl, const char *key_share)
     g_want_share = (unsigned)g->id;
 }
 
-/* Returns the socket; for the server also binds it and stores the bound port. */
-static int open_socket(const struct options *o, struct sockaddr_storage *addr, socklen_t *addrlen,
-                       int *bound_port)
+static int resolve_and_open(const struct options *o, struct sockaddr_storage *addr,
+                            socklen_t *addrlen)
 {
     struct addrinfo hints, *res;
-    int fd, rc, one = 1;
+    int fd, rc;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_socktype = g_tls ? SOCK_STREAM : SOCK_DGRAM;
     hints.ai_flags = g_is_client ? 0 : AI_PASSIVE;
     rc = getaddrinfo(o->host, o->port, &hints, &res);
     if (rc != 0)
@@ -539,25 +703,55 @@ static int open_socket(const struct options *o, struct sockaddr_storage *addr, s
     memcpy(addr, res->ai_addr, res->ai_addrlen);
     *addrlen = res->ai_addrlen;
     freeaddrinfo(res);
-    if (!g_is_client) {
-        struct sockaddr_storage local;
-        socklen_t local_len = sizeof(local);
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(fd, (struct sockaddr *)addr, *addrlen) != 0)
-            fail(EXIT_FAIL, "bind %s:%s: %s", o->host, o->port, strerror(errno));
-        if (getsockname(fd, (struct sockaddr *)&local, &local_len) != 0)
-            fail(EXIT_FAIL, "getsockname: %s", strerror(errno));
-        *bound_port = local.ss_family == AF_INET6
-                          ? ntohs(((struct sockaddr_in6 *)&local)->sin6_port)
-                          : ntohs(((struct sockaddr_in *)&local)->sin_port);
+    return fd;
+}
+
+/* Server: the UDP socket, or the TCP listening socket, bound once for all connections. */
+static int open_server_socket(const struct options *o, int *bound_port)
+{
+    struct sockaddr_storage addr, local;
+    socklen_t addrlen, local_len = sizeof(local);
+    int fd = resolve_and_open(o, &addr, &addrlen), one = 1;
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(fd, (struct sockaddr *)&addr, addrlen) != 0)
+        fail(EXIT_FAIL, "bind %s:%s: %s", o->host, o->port, strerror(errno));
+    if (g_tls && listen(fd, 4) != 0)
+        fail(EXIT_FAIL, "listen: %s", strerror(errno));
+    if (getsockname(fd, (struct sockaddr *)&local, &local_len) != 0)
+        fail(EXIT_FAIL, "getsockname: %s", strerror(errno));
+    *bound_port = local.ss_family == AF_INET6 ? ntohs(((struct sockaddr_in6 *)&local)->sin6_port)
+                                              : ntohs(((struct sockaddr_in *)&local)->sin_port);
+    return fd;
+}
+
+/* Client: a new socket per connection, so connection 2 has a new UDP source port. */
+static int open_client_socket(const struct options *o, WOLFSSL *ssl)
+{
+    struct sockaddr_storage addr;
+    socklen_t addrlen;
+    int fd = resolve_and_open(o, &addr, &addrlen);
+
+    if (g_tls) {
+        while (connect(fd, (struct sockaddr *)&addr, addrlen) != 0)
+            if (errno != EINTR)
+                fail(EXIT_FAIL, "connect %s:%s: %s", o->host, o->port, strerror(errno));
+    }
+    else if (wolfSSL_dtls_set_peer(ssl, &addr, addrlen) != WOLFSSL_SUCCESS) {
+        fail(EXIT_FAIL, "wolfSSL_dtls_set_peer failed");
     }
     return fd;
 }
 
 static WOLFSSL_CTX *make_ctx(const struct options *o)
 {
-    WOLFSSL_CTX *ctx = wolfSSL_CTX_new(g_is_client ? wolfDTLSv1_3_client_method()
-                                                   : wolfDTLSv1_3_server_method());
+    WOLFSSL_METHOD *method;
+    WOLFSSL_CTX *ctx;
+    if (g_tls)
+        method = g_is_client ? wolfTLSv1_3_client_method() : wolfTLSv1_3_server_method();
+    else
+        method = g_is_client ? wolfDTLSv1_3_client_method() : wolfDTLSv1_3_server_method();
+    ctx = wolfSSL_CTX_new(method);
     if (ctx == NULL)
         fail(EXIT_FAIL, "wolfSSL_CTX_new failed");
     if (g_is_client) {
@@ -572,8 +766,8 @@ static WOLFSSL_CTX *make_ctx(const struct options *o)
         if (wolfSSL_CTX_use_PrivateKey_file(ctx, o->key, WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS)
             fail(EXIT_FAIL, "cannot load key %s", o->key);
     }
-    wolfSSL_CTX_SetIORecv(ctx, recv_cb);
-    wolfSSL_CTX_SetIOSend(ctx, send_cb);
+    wolfSSL_CTX_SetIORecv(ctx, g_tls ? tls_recv_cb : dtls_recv_cb);
+    wolfSSL_CTX_SetIOSend(ctx, g_tls ? tls_send_cb : dtls_send_cb);
     return ctx;
 }
 
@@ -601,11 +795,8 @@ static void configure_ssl(WOLFSSL *ssl, const struct options *o)
 
 _Noreturn static void finish_fail(WOLFSSL *ssl, int ret, const char *what)
 {
-    char err[256], msg[320];
-    snprintf(msg, sizeof(msg), "%s: %s", what, error_string(ssl, ret, err, sizeof(err)));
-    log_msg("%s", msg);
-    emit_result(0, NULL, NULL, msg);
-    exit(EXIT_FAIL);
+    char err[256];
+    fail(EXIT_FAIL, "%s: %s", what, error_string(ssl, ret, err, sizeof(err)));
 }
 
 static int handshake(WOLFSSL *ssl, int accept_tls13)
@@ -646,13 +837,20 @@ static int wait_readable(int fd, long long deadline)
     }
 }
 
-/* Teardown is bounded by poll(), so wolfSSL must not block in recvfrom. */
-static void set_nonblocking(WOLFSSL *ssl, int fd)
+static void set_blocking(int fd, int blocking)
 {
     int flags = fcntl(fd, F_GETFL);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
-        log_msg("teardown: fcntl: %s", strerror(errno));
-    wolfSSL_dtls_set_using_nonblock(ssl, 1);
+    if (flags < 0 ||
+        fcntl(fd, F_SETFL, blocking ? flags & ~O_NONBLOCK : flags | O_NONBLOCK) < 0)
+        log_msg("fcntl: %s", strerror(errno));
+}
+
+/* Teardown is bounded by poll(), so wolfSSL must not block in recv. */
+static void set_nonblocking(WOLFSSL *ssl, int fd)
+{
+    set_blocking(fd, 0);
+    if (!g_tls)
+        wolfSSL_dtls_set_using_nonblock(ssl, 1);
 }
 
 /* Client, after pong: send close_notify, then wait up to 2 s for the server's. */
@@ -709,48 +907,82 @@ static void server_teardown(WOLFSSL *ssl, int fd)
         log_msg("teardown: wolfSSL_shutdown error %d", wolfSSL_get_error(ssl, ret));
 }
 
-int main(int argc, char **argv)
+static int same_addr(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
 {
-    struct options o;
-    struct sockaddr_storage addr;
-    socklen_t addrlen;
-    WOLFSSL_CTX *ctx;
+    if (a->ss_family != b->ss_family)
+        return 0;
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const void *)a, *y = (const void *)b;
+        return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, 16) == 0;
+    }
+    const struct sockaddr_in *x = (const void *)a, *y = (const void *)b;
+    return x->sin_port == y->sin_port && x->sin_addr.s_addr == y->sin_addr.s_addr;
+}
+
+/* DTLS server before connection 2: a late datagram of connection 1 (e.g. an ACK) must not
+ * become the new WOLFSSL's peer. */
+static void drop_stale_datagrams(int fd, const struct sockaddr_storage *old_peer)
+{
+    for (;;) {
+        struct pollfd p = {.fd = fd, .events = POLLIN};
+        struct sockaddr_storage from;
+        socklen_t from_len = sizeof(from);
+        char b[1];
+        ssize_t r;
+        if (poll(&p, 1, 0) <= 0)
+            return;
+        r = recvfrom(fd, b, sizeof(b), MSG_PEEK, (struct sockaddr *)&from, &from_len);
+        if (r < 0 || !same_addr(&from, old_peer))
+            return;
+        recv(fd, b, sizeof(b), 0);
+        log_msg("dropped a late datagram from the connection 1 peer");
+    }
+}
+
+struct session_state {
+    WOLFSSL_SESSION *ticket;           /* client: received on connection 1 */
+    struct sockaddr_storage peer;      /* DTLS server: connection 1 peer */
+    int have_peer;
+};
+
+/* Runs one full connection lifecycle; any failure exits with the result line. */
+static void run_connection(WOLFSSL_CTX *ctx, const struct options *o, int server_fd,
+                           int accept_tls13, struct session_state *st)
+{
     WOLFSSL *ssl;
-    struct sigaction sa;
     char buf[64];
-    int fd, ret, port = 0, accept_tls13;
-    const char *version, *group;
+    int fd, ret, have_ticket = 0;
 
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    parse_args(argc, argv, &o);
-    accept_tls13 = strcmp(o.variant, "accept-tls13") == 0;
+    g_hrr = g_hrr_cookie = g_hrr_group = 0;
+    g_handshake_started = 0;
+    g_resumed = -1;
+    g_version = g_group = NULL;
+    stream_reset(&g_rx);
+    stream_reset(&g_tx);
+    alarm(DEADLINE_SECONDS);
 
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_deadline;
-    sigaction(SIGALRM, &sa, NULL);
-
-    /* Adds wolfSSL's own debug log to stderr; it does not change behaviour. */
-    if (getenv("DTLS_INTEROP_WOLFSSL_DEBUG") != NULL)
-        wolfSSL_Debugging_ON();
-    if (wolfSSL_Init() != WOLFSSL_SUCCESS)
-        fail(EXIT_FAIL, "wolfSSL_Init failed");
-    log_msg("wolfSSL %s, role %s, variant %s", LIBWOLFSSL_VERSION_STRING, o.role, o.variant);
-
-    ctx = make_ctx(&o);
     ssl = wolfSSL_new(ctx);
     if (ssl == NULL)
         fail(EXIT_FAIL, "wolfSSL_new failed");
-    configure_ssl(ssl, &o);
-
-    fd = open_socket(&o, &addr, &addrlen, &port);
+    configure_ssl(ssl, o);
+    if (g_is_client) {
+        if (st->ticket != NULL && wolfSSL_set_session(ssl, st->ticket) != WOLFSSL_SUCCESS)
+            fail(EXIT_FAIL, "wolfSSL_set_session rejected the connection 1 session");
+        fd = open_client_socket(o, ssl);
+    }
+    else if (g_tls) {
+        while ((fd = accept(server_fd, NULL, NULL)) < 0)
+            if (errno != EINTR)
+                fail(EXIT_FAIL, "accept: %s", strerror(errno));
+    }
+    else {
+        fd = server_fd;
+        set_blocking(fd, 1); /* connection 1 teardown left it non-blocking */
+        if (st->have_peer)
+            drop_stale_datagrams(fd, &st->peer);
+    }
     if (wolfSSL_set_fd(ssl, fd) != WOLFSSL_SUCCESS)
         fail(EXIT_FAIL, "wolfSSL_set_fd failed");
-    if (g_is_client && wolfSSL_dtls_set_peer(ssl, &addr, addrlen) != WOLFSSL_SUCCESS)
-        fail(EXIT_FAIL, "wolfSSL_dtls_set_peer failed");
-
-    alarm(DEADLINE_SECONDS);
-    if (!g_is_client)
-        printf("{\"event\": \"ready\", \"port\": %d}\n", port);
 
     ret = handshake(ssl, accept_tls13);
     if (ret != WOLFSSL_SUCCESS && g_share_replaced) {
@@ -758,13 +990,15 @@ int main(int argc, char **argv)
         fail(EXIT_UNSUPPORTED,
              "unsupported: CH1 with the --key-share=%s share exceeds the MTU, and wolfSSL "
              "sends an empty key_share instead of fragmenting CH1",
-             o.key_share);
+             o->key_share);
     }
     if (ret != WOLFSSL_SUCCESS)
         finish_fail(ssl, ret, "handshake");
-    version = wolfSSL_get_version(ssl);
-    group = negotiated_group(ssl);
-    log_msg("handshake done: %s, group %s", version, group ? group : "?");
+    g_version = wolfSSL_get_version(ssl);
+    g_group = negotiated_group(ssl);
+    g_resumed = wolfSSL_session_reused(ssl) != 0;
+    log_msg("connection %d: handshake done: %s, group %s, resumed %s", (int)g_conn, g_version,
+            g_group ? g_group : "?", json_bool(g_resumed));
 
     if (g_is_client && (ret = wolfSSL_write(ssl, "ping", 4)) != 4)
         finish_fail(ssl, ret, "write");
@@ -776,16 +1010,82 @@ int main(int argc, char **argv)
     if (!g_is_client && (ret = wolfSSL_write(ssl, "pong", 4)) != 4)
         finish_fail(ssl, ret, "write");
     alarm(0);
+    /* The contract judges the ticket at the time pong has been read. */
+    if (g_is_client && g_ticket && st->ticket == NULL) {
+        /* wolfSSL_SESSION_has_ticket() needs OPENSSL_EXTRA; this is the length-only query. */
+        word32 ticket_len = 0;
+        wolfSSL_get_SessionTicket(ssl, NULL, &ticket_len);
+        have_ticket = ticket_len > 0;
+        st->ticket = wolfSSL_get1_session(ssl);
+        log_msg("connection 1: session ticket of %u bytes", (unsigned)ticket_len);
+    }
 
     /* The verdict is final here; teardown problems are only logged. */
     if (g_is_client)
         client_teardown(ssl, fd);
     else
         server_teardown(ssl, fd);
-    emit_result(1, version, group, NULL);
+    if (!g_tls && !g_is_client) {
+        unsigned int peer_len = sizeof(st->peer);
+        st->have_peer = wolfSSL_dtls_get_peer(ssl, &st->peer, &peer_len) == WOLFSSL_SUCCESS;
+    }
     wolfSSL_free(ssl);
+    if (g_is_client || g_tls)
+        close(fd);
+    if (g_is_client && g_ticket && g_conn == 1 && !have_ticket)
+        fail(EXIT_FAIL, "no session ticket received");
+}
+
+int main(int argc, char **argv)
+{
+    struct options o;
+    struct session_state st;
+    WOLFSSL_CTX *ctx;
+    WOLFSSL *probe;
+    struct sigaction sa;
+    int server_fd = -1, port = 0, accept_tls13, connections;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    parse_args(argc, argv, &o);
+    g_conn = 1;
+    accept_tls13 = strcmp(o.variant, "accept-tls13") == 0;
+    if (accept_tls13 && g_tls)
+        fail(EXIT_UNSUPPORTED, "unsupported: variant accept-tls13 is DTLS-only");
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_deadline;
+    sigaction(SIGALRM, &sa, NULL);
+
+    /* Adds wolfSSL's own debug log to stderr; it does not change behaviour. */
+    if (getenv("DTLS_INTEROP_WOLFSSL_DEBUG") != NULL)
+        wolfSSL_Debugging_ON();
+    if (wolfSSL_Init() != WOLFSSL_SUCCESS)
+        fail(EXIT_FAIL, "wolfSSL_Init failed");
+    log_msg("wolfSSL %s, role %s, variant %s, transport %s, resume %s", LIBWOLFSSL_VERSION_STRING,
+            o.role, o.variant, o.transport, o.resume);
+
+    memset(&st, 0, sizeof(st));
+    ctx = make_ctx(&o);
+    /* Reject an unsupported configuration (exit 2) before binding or connecting. */
+    probe = wolfSSL_new(ctx);
+    if (probe == NULL)
+        fail(EXIT_FAIL, "wolfSSL_new failed");
+    configure_ssl(probe, &o);
+    wolfSSL_free(probe);
+    if (!g_is_client) {
+        server_fd = open_server_socket(&o, &port);
+        printf("{\"event\": \"ready\", \"port\": %d}\n", port);
+    }
+    connections = g_ticket ? 2 : 1;
+    for (g_conn = 1; g_conn <= connections; g_conn++)
+        run_connection(ctx, &o, server_fd, accept_tls13, &st);
+    g_conn = connections;
+    emit_result(1, NULL);
+    if (st.ticket != NULL)
+        wolfSSL_SESSION_free(st.ticket);
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();
-    close(fd);
+    if (server_fd >= 0)
+        close(server_fd);
     return 0;
 }

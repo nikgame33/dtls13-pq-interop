@@ -59,5 +59,8 @@ Record and handshake headers are derived with `records.parse_datagram(d.payload)
 - CH1/CH2 message size and fragment count as the client sent them, before any proxy rule.
 A run fails if they contradict the scenario's CH1/CH2 fragmentation expectation.
 - Path: PMTU, impairments, `split_ch1` (the proxy, not the client, split CH1), and `actions`: how many datagrams the proxy dropped, delayed or replaced, by reason (e.g. `replaced: split CH1 into 2 fragments`).
+- TLS cases (T01): byte-stream trace from the runner's TCP relay, one flow per TCP connection (ADR 0004).
+- `cookie_echoed`: whether the second ClientHello echoed the HRR cookie unchanged, read from the trace per flow.
+- `resumed` in each adapter's result line: whether the last connection was a PSK resumption (S10 runs two connections).
 - Round trips to completion.
 - Bytes sent by the server before address validation (amplification ratio vs. bytes received).

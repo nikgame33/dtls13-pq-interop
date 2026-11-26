@@ -154,7 +154,9 @@ def test_several_handshake_fragments_in_one_record() -> None:
 
 
 def test_hello_retry_request_with_cookie() -> None:
-    hrr = hello_retry_request(ext(43, u16(0xFEFC)), ext(51, u16(X25519MLKEM768)), ext(44, u16(3)))
+    hrr = hello_retry_request(
+        ext(43, u16(0xFEFC)), ext(51, u16(X25519MLKEM768)), ext(44, u16(3) + b"abc")
+    )
     (frag,) = parse_datagram(plaintext(22, hs_fragment(2, hrr))).handshake_fragments()
     assert frag.hello == HelloInfo(
         kind="hello_retry_request",
@@ -163,6 +165,7 @@ def test_hello_retry_request_with_cookie() -> None:
         cookie=True,
         supported_groups=(),
         partial=False,
+        cookie_data=b"abc",
     )
 
 

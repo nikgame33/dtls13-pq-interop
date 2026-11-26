@@ -218,21 +218,33 @@ def test_released_packets_continue_through_later_rules(
     assert {d.index: d.action for d in proxy.trace} == {0: "dropped", 1: "delayed", 2: "forwarded"}
 
 
-def test_second_client_is_dropped(server: socket.socket, client: socket.socket) -> None:
+def test_each_client_address_is_its_own_flow(server: socket.socket, client: socket.socket) -> None:
+    # A resumed second connection (ADR 0004) comes from a new port and must reach the server
+    # from a new port too, as it would without the proxy.
     with (
         UdpProxy(server=server_addr(server)) as proxy,
         socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other,
     ):
+        other.settimeout(TIMEOUT)
         client.sendto(b"first", proxy.address)
-        assert server.recv(2048) == b"first"
-        other.sendto(b"intruder", proxy.address)
-        client.sendto(b"second", proxy.address)
-        assert server.recv(2048) == b"second"
-        wait_entries(proxy, 3)
-    assert [(d.payload, d.action, d.reason) for d in proxy.trace] == [
-        (b"first", "forwarded", None),
-        (b"intruder", "dropped", "unexpected source"),
-        (b"second", "forwarded", None),
+        data, upstream1 = server.recvfrom(2048)
+        assert data == b"first"
+        other.sendto(b"second", proxy.address)
+        data, upstream2 = server.recvfrom(2048)
+        assert data == b"second" and upstream2 != upstream1
+        server.sendto(b"to second", upstream2)
+        server.sendto(b"to first", upstream1)
+        assert other.recvfrom(2048) == (b"to second", proxy.address)
+        assert client.recvfrom(2048) == (b"to first", proxy.address)
+        client.sendto(b"first again", proxy.address)
+        assert server.recvfrom(2048) == (b"first again", upstream1)
+        wait_entries(proxy, 5)
+    assert [(d.payload, d.direction, d.flow, d.action) for d in proxy.trace] == [
+        (b"first", "c2s", 0, "forwarded"),
+        (b"second", "c2s", 1, "forwarded"),
+        (b"to second", "s2c", 1, "forwarded"),
+        (b"to first", "s2c", 0, "forwarded"),
+        (b"first again", "c2s", 0, "forwarded"),
     ]
 
 

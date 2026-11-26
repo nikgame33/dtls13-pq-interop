@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from dtls_interop import hello_trace
 from dtls_interop.implementations import CLIENT, SERVER, Implementation
 from dtls_interop.path import TraceSummary, proxy_path, summarize
 from dtls_interop.pki import TestPki
@@ -30,6 +31,7 @@ from dtls_interop.results import (
     write_result,
 )
 from dtls_interop.scenarios import PathConditions, Scenario, Transport
+from dtls_interop.tcp_proxy import TcpProxy
 
 LOOPBACK = "127.0.0.1"
 DEFAULT_READY_TIMEOUT = 10.0
@@ -48,8 +50,11 @@ _RESULT_FIELDS = {
     "hrr": (bool, True),
     "hrr_cookie": (bool, True),
     "hrr_group": (bool, True),
+    "resumed": (bool, True),
     "error": (str, True),
 }
+# Keys of a result line compared with the scenario's Expected.
+_EXPECTED_KEYS = ("version", "group", "hrr", "hrr_cookie", "hrr_group", "resumed")
 EXIT_UNSUPPORTED = 2
 EXIT_USAGE = 64
 # Exit codes that decide the outcome whatever the peer does, so the peer is stopped at once.
@@ -60,7 +65,7 @@ type Address = tuple[str, int]
 
 
 class PathHandle(Protocol):
-    """An active network path between client and server, e.g. the UDP proxy.
+    """An active DTLS network path between client and server, e.g. the UDP proxy.
 
     If it also has a `trace` attribute (a list of datagrams), the runner writes it to trace.jsonl.
     """
@@ -70,8 +75,13 @@ class PathHandle(Protocol):
 
 
 # Called with the server's bound address and the path conditions once the server is ready;
-# exited after both adapters are reaped. May raise to refuse unknown impairments.
+# exited after both adapters are reaped. May raise to refuse unknown impairments. DTLS only:
+# TLS cases always run through a TcpProxy.
 type PathFactory = Callable[[Address, PathConditions], AbstractContextManager[PathHandle]]
+
+
+def _resume(scenario: Scenario) -> str:
+    return "ticket" if scenario.resumption else "off"
 
 
 def server_command(impl: Implementation, scenario: Scenario, pki: TestPki) -> list[str]:
@@ -81,6 +91,8 @@ def server_command(impl: Implementation, scenario: Scenario, pki: TestPki) -> li
         str(impl.adapter),
         "--role=server",
         f"--variant={impl.variant}",
+        f"--transport={scenario.transport}",
+        f"--resume={_resume(scenario)}",
         f"--host={LOOPBACK}",
         "--port=0",
         f"--groups={','.join(s.groups)}",
@@ -100,6 +112,8 @@ def client_command(
         str(impl.adapter),
         "--role=client",
         f"--variant={impl.variant}",
+        f"--transport={scenario.transport}",
+        f"--resume={_resume(scenario)}",
         f"--host={address[0]}",
         f"--port={address[1]}",
         f"--groups={','.join(c.groups)}",
@@ -302,24 +316,39 @@ def _signal_name(code: int) -> str:
         return f"signal {-code}"
 
 
-def _precheck(scenario: Scenario, path_factory: PathFactory | None) -> str | None:
-    if scenario.transport is not Transport.DTLS:
-        return f"{scenario.transport} transport is not in the adapter contract"
-    if scenario.resumption:
-        return "PSK resumption is not implemented in the runner"
+def _precheck(
+    scenario: Scenario,
+    client: Implementation,
+    server: Implementation,
+    path_factory: PathFactory | None,
+) -> tuple[Outcome, str] | None:
+    """Why the case cannot run, decided without starting an adapter; None if it can."""
+    for role, impl in (("client", client), ("server", server)):
+        if scenario.transport not in impl.transports:
+            declared = ",".join(sorted(impl.transports))
+            reason = f"{role}: {impl.id} does not declare the {scenario.transport} transport"
+            return Outcome.UNSUPPORTED, f"{reason} (declares {declared})"
+    shaped = scenario.path.impairments or scenario.path.split_ch1 is not None
+    if shaped and scenario.transport is Transport.TLS:
+        return Outcome.ERROR, "path impairments are not available over tls"
     if scenario.path.impairments and path_factory is None:
-        return "path impairments not available"
+        return Outcome.ERROR, "path impairments not available"
     if scenario.path.split_ch1 is not None and path_factory is None:
-        return "CH1 split needs the proxy"
+        return Outcome.ERROR, "CH1 split needs the proxy"
     return None
 
 
-def _expectation_mismatches(scenario: Scenario, sides: list[_Adapter]) -> list[str]:
+def _expectation_mismatches(
+    scenario: Scenario, sides: list[_Adapter], echoed: bool | None
+) -> list[str]:
     exp = scenario.expected
     out = []
+    if exp.cookie_echoed is not None and echoed is not None and echoed != exp.cookie_echoed:
+        seen = "echoed" if echoed else "did not echo"
+        out.append(f"trace: the client {seen} the HRR cookie in CH2")
     for side in sides:
         result = side.result or {}
-        for key in ("version", "group", "hrr", "hrr_cookie", "hrr_group"):
+        for key in _EXPECTED_KEYS:
             want, got = getattr(exp, key), result.get(key)
             if want is not None and got is not None and got != want:
                 out.append(f"{side.role} reported {key}={got!r}, expected {want!r}")
@@ -338,6 +367,13 @@ def _fragmentation_mismatches(scenario: Scenario, summary: TraceSummary) -> list
         got = f"in {sent.fragments} fragments" if sent.fragments > 1 else "unfragmented"
         out.append(f"client sent {name} {got}, expected {'fragmented' if want else 'unfragmented'}")
     return out
+
+
+def cookie_echoed(path: object) -> bool | None:
+    """The trace's verdict on CH2 echoing the HRR cookie; None without a trace or the messages."""
+    trace = getattr(path, "trace", None)
+    flows = None if trace is None else hello_trace.trace_flows(trace)
+    return None if flows is None else hello_trace.cookie_echoed(flows)
 
 
 def _json_default(o: object) -> Any:
@@ -374,6 +410,7 @@ def _classify(
     ready: bool,
     limits: _Limits,
     summary: TraceSummary | None,
+    echoed: bool | None,
 ) -> tuple[Outcome, str | None]:
     sides = [a for a in (server, client) if a.started]
     for a in sides:
@@ -409,8 +446,10 @@ def _classify(
         return Outcome.TIMEOUT, "server did not exit after the client finished"
     failed = [a.error_text() for a in sides if a.exit_code == 1]
     if failed:
+        if scenario.expected.cookie_echoed and echoed is False:
+            failed.insert(0, "trace: the client did not echo the HRR cookie in CH2")
         return Outcome.FAIL, "; ".join(failed)
-    mismatches = _expectation_mismatches(scenario, sides)
+    mismatches = _expectation_mismatches(scenario, sides, echoed)
     if summary is not None:
         mismatches += _fragmentation_mismatches(scenario, summary)
     if mismatches:
@@ -475,9 +514,10 @@ def _execute(
                 if port is None:
                     raise _Abort(f"server: ready line without a valid port: {ready!r}")
                 address: Address = (LOOPBACK, port)
-                if path_factory is not None:
+                factory = _tls_path if scenario.transport is Transport.TLS else path_factory
+                if factory is not None:
                     try:
-                        cm = path_factory(address, scenario.path)
+                        cm = factory(address, scenario.path)
                         path = stack.enter_context(_GuardedPath(cm))
                     except Exception as e:  # plugin boundary: a refusal is a recorded error
                         raise _Abort(f"path setup failed: {e}") from e
@@ -497,6 +537,11 @@ def _execute(
     except _PathFailed as e:
         return f"path failed: {e}", True, path
     return None, True, path
+
+
+def _tls_path(address: Address, conditions: PathConditions) -> TcpProxy:
+    # The proxy's trace is the only view of the TLS handshake bytes (ADR 0004).
+    return TcpProxy(address)
 
 
 def run_case(
@@ -528,19 +573,19 @@ def run_case(
     client = _Adapter("client", client_impl, [], case_dir)
     limits = _Limits(ready_timeout, case_timeout, server_grace)
 
-    path = None
-    summary = None
-    precheck = _precheck(scenario, path_factory)
+    path = summary = echoed = None
+    precheck = _precheck(scenario, client_impl, server_impl, path_factory)
     if precheck is not None:
-        outcome, reason = Outcome.ERROR, precheck
+        outcome, reason = precheck
     else:
         abort, ready, path = _execute(scenario, server, client, pki, path_factory, limits)
         trace = getattr(path, "trace", None)
         summary = summarize(trace) if trace is not None else None
+        echoed = cookie_echoed(path)
         if abort is not None:
             outcome, reason = Outcome.ERROR, abort
         else:
-            outcome, reason = _classify(scenario, server, client, ready, limits, summary)
+            outcome, reason = _classify(scenario, server, client, ready, limits, summary, echoed)
 
     result = CaseResult(
         schema_version=SCHEMA_VERSION,
@@ -564,6 +609,7 @@ def run_case(
         ch1_fragments=summary.ch1.fragments if summary and summary.ch1 else None,
         ch2_size=summary.ch2.size if summary and summary.ch2 else None,
         ch2_fragments=summary.ch2.fragments if summary and summary.ch2 else None,
+        cookie_echoed=echoed,
     )
     write_result(case_dir, result)
     return result

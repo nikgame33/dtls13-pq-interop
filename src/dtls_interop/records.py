@@ -1,6 +1,7 @@
-"""Best-effort parser for the DTLS records in one UDP datagram (RFC 9147 sec 4).
+"""Best-effort parsers for trace payloads: the DTLS records in one UDP datagram (RFC 9147 sec 4)
+and the plaintext handshake at the start of a TLS 1.3 byte stream (RFC 9846 sec 5.1).
 
-Built for traces: it never raises on malformed input and reports how far it got instead.
+Built for traces: they never raise on malformed input and report how far they got instead.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ HRR_RANDOM = bytes.fromhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e
 
 PLAINTEXT_HEADER_LEN = 13
 HANDSHAKE_HEADER_LEN = 12
+TLS_RECORD_HEADER_LEN = 5
+TLS_HANDSHAKE_HEADER_LEN = 4
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class HelloInfo:
     cookie: bool
     supported_groups: tuple[int, ...]
     partial: bool  # the message body was cut off before the end of the extensions
+    cookie_data: bytes | None = None  # Cookie.cookie (RFC 9846 sec 4.3.2), if fully present
 
 
 @dataclass(frozen=True)
@@ -318,10 +322,13 @@ class _Reader:
         return self.data[self.pos :]
 
 
-def parse_hello(msg_type: int, body: bytes, *, complete: bool = True) -> HelloInfo | None:
+def parse_hello(
+    msg_type: int, body: bytes, *, complete: bool = True, dtls: bool = True
+) -> HelloInfo | None:
     """Extract key exchange details from a ClientHello or HRR body starting at offset 0.
 
     Returns None for a ServerHello that is not an HRR. ``complete=False`` marks the result partial.
+    ``dtls=False`` parses the TLS ClientHello, which has no legacy_cookie field.
     """
     r = _Reader(body)
     try:
@@ -339,11 +346,13 @@ def parse_hello(msg_type: int, body: bytes, *, complete: bool = True) -> HelloIn
     selected: list[int] = []
     groups: list[int] = []
     cookie = False
+    cookie_data: bytes | None = None
     partial = not complete
     try:
         r.vector(1)  # legacy_session_id
         if kind == "client_hello":
-            r.vector(1)  # legacy_cookie
+            if dtls:
+                r.vector(1)  # legacy_cookie
             r.vector(2)  # cipher_suites
             r.vector(1)  # legacy_compression_methods
         else:
@@ -359,7 +368,9 @@ def parse_hello(msg_type: int, body: bytes, *, complete: bool = True) -> HelloIn
                 cookie = True
             ext = _Reader(exts.remaining[:ext_len])
             try:
-                if ext_type == EXT_SUPPORTED_GROUPS:
+                if ext_type == EXT_COOKIE:
+                    cookie_data = ext.vector(2)
+                elif ext_type == EXT_SUPPORTED_GROUPS:
                     _read_groups(ext, groups)
                 elif ext_type == EXT_KEY_SHARE and kind == "client_hello":
                     _read_client_shares(ext, key_shares)
@@ -376,6 +387,7 @@ def parse_hello(msg_type: int, body: bytes, *, complete: bool = True) -> HelloIn
         cookie=cookie,
         supported_groups=tuple(groups),
         partial=partial,
+        cookie_data=cookie_data,
     )
 
 
@@ -418,3 +430,60 @@ def reassemble(fragments: Iterable[HandshakeFragment]) -> bytes | None:
     for f in frags:
         buf[f.fragment_offset : f.end] = f.body
     return bytes(buf)
+
+
+@dataclass(frozen=True)
+class TlsHandshakeMessage:
+    msg_type: int
+    body: bytes
+    hello: HelloInfo | None
+
+
+@dataclass(frozen=True)
+class TlsHandshakeStream:
+    """The plaintext handshake messages one TLS endpoint sent before it switched to encryption."""
+
+    messages: tuple[TlsHandshakeMessage, ...]
+    error: str | None = None  # set when the stream ended inside a record or message
+
+
+def parse_tls_handshake(stream: bytes) -> TlsHandshakeStream:
+    """Parse the plaintext handshake records at the start of one direction of a TLS stream.
+
+    Handshake messages may span records (RFC 9846 sec 5.1). Parsing stops at the first record
+    that is neither handshake nor change_cipher_spec, i.e. once the sender encrypts.
+    """
+    data = bytearray()
+    pos = 0
+    error = None
+    while pos < len(stream):
+        if len(stream) - pos < TLS_RECORD_HEADER_LEN:
+            error = f"truncated TLS record header at offset {pos}"
+            break
+        content_type = stream[pos]
+        length = int.from_bytes(stream[pos + 3 : pos + 5])
+        if content_type not in (CONTENT_HANDSHAKE, CONTENT_CHANGE_CIPHER_SPEC):
+            break
+        fragment = stream[pos + TLS_RECORD_HEADER_LEN : pos + TLS_RECORD_HEADER_LEN + length]
+        if len(fragment) < length:
+            error = f"TLS record at offset {pos} truncated: {len(fragment)} of {length} bytes"
+        if content_type == CONTENT_HANDSHAKE:
+            data += fragment
+        pos += TLS_RECORD_HEADER_LEN + length
+    messages = []
+    i = 0
+    while len(data) - i >= TLS_HANDSHAKE_HEADER_LEN:
+        msg_type = data[i]
+        length = int.from_bytes(data[i + 1 : i + 4])
+        body = bytes(data[i + TLS_HANDSHAKE_HEADER_LEN : i + TLS_HANDSHAKE_HEADER_LEN + length])
+        if len(body) < length:
+            error = error or f"handshake message at offset {i} truncated"
+            break
+        hello = None
+        if msg_type in (HS_CLIENT_HELLO, HS_SERVER_HELLO):
+            hello = parse_hello(msg_type, body, dtls=False)
+        messages.append(TlsHandshakeMessage(msg_type, body, hello))
+        i += TLS_HANDSHAKE_HEADER_LEN + length
+    if error is None and i < len(data):
+        error = f"truncated handshake header at offset {i}"
+    return TlsHandshakeStream(tuple(messages), error)
