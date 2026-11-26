@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dtls_interop.implementations import CLIENT, SERVER, Implementation
+from dtls_interop.path import TraceSummary, proxy_path, summarize
 from dtls_interop.pki import TestPki
 from dtls_interop.results import (
     SCHEMA_VERSION,
@@ -51,6 +52,9 @@ _RESULT_FIELDS = {
 }
 EXIT_UNSUPPORTED = 2
 EXIT_USAGE = 64
+# Exit codes that decide the outcome whatever the peer does, so the peer is stopped at once.
+_DECISIVE_EXITS = frozenset({EXIT_UNSUPPORTED, EXIT_USAGE})
+_POLL_INTERVAL = 0.02
 
 type Address = tuple[str, int]
 
@@ -218,6 +222,17 @@ class _Adapter:
         self._exited()
         return True
 
+    def poll_exit(self) -> bool:
+        assert self.proc is not None
+        if self.proc.poll() is None:
+            return False
+        self._exited()
+        return True
+
+    @property
+    def decisive_exit(self) -> bool:
+        return self.exit_code in _DECISIVE_EXITS
+
     def _exited(self) -> None:
         assert self.proc is not None
         if self.duration is None:
@@ -294,6 +309,8 @@ def _precheck(scenario: Scenario, path_factory: PathFactory | None) -> str | Non
         return "PSK resumption is not implemented in the runner"
     if scenario.path.impairments and path_factory is None:
         return "path impairments not available"
+    if scenario.path.split_ch1 is not None and path_factory is None:
+        return "CH1 split needs the proxy"
     return None
 
 
@@ -306,6 +323,20 @@ def _expectation_mismatches(scenario: Scenario, sides: list[_Adapter]) -> list[s
             want, got = getattr(exp, key), result.get(key)
             if want is not None and got is not None and got != want:
                 out.append(f"{side.role} reported {key}={got!r}, expected {want!r}")
+    return out
+
+
+def _fragmentation_mismatches(scenario: Scenario, summary: TraceSummary) -> list[str]:
+    out = []
+    checks = (
+        ("CH1", scenario.expected.ch1_fragmented, summary.ch1),
+        ("CH2", scenario.expected.ch2_fragmented, summary.ch2),
+    )
+    for name, want, sent in checks:
+        if want is None or sent is None or (sent.fragments > 1) == want:
+            continue
+        got = f"in {sent.fragments} fragments" if sent.fragments > 1 else "unfragmented"
+        out.append(f"client sent {name} {got}, expected {'fragmented' if want else 'unfragmented'}")
     return out
 
 
@@ -337,7 +368,12 @@ class _Limits:
 
 
 def _classify(
-    scenario: Scenario, server: _Adapter, client: _Adapter, ready: bool, limits: _Limits
+    scenario: Scenario,
+    server: _Adapter,
+    client: _Adapter,
+    ready: bool,
+    limits: _Limits,
+    summary: TraceSummary | None,
 ) -> tuple[Outcome, str | None]:
     sides = [a for a in (server, client) if a.started]
     for a in sides:
@@ -375,6 +411,8 @@ def _classify(
     if failed:
         return Outcome.FAIL, "; ".join(failed)
     mismatches = _expectation_mismatches(scenario, sides)
+    if summary is not None:
+        mismatches += _fragmentation_mismatches(scenario, summary)
     if mismatches:
         return Outcome.FAIL, "; ".join(mismatches)
     return Outcome.PASS, None
@@ -384,6 +422,33 @@ class _Abort(Exception):
     """Stop the case early with outcome error and this reason."""
 
 
+class _PathFailed(Exception):
+    """The path raised while shutting down, e.g. a proxy rule failed on a datagram."""
+
+
+class _GuardedPath(AbstractContextManager[PathHandle]):
+    def __init__(self, cm: AbstractContextManager[PathHandle]) -> None:
+        self._cm = cm
+
+    def __enter__(self) -> PathHandle:
+        return self._cm.__enter__()
+
+    def __exit__(self, *exc_info: Any) -> bool | None:
+        if exc_info[0] is not None:
+            return self._cm.__exit__(*exc_info)
+        try:
+            return self._cm.__exit__(*exc_info)
+        except Exception as e:
+            raise _PathFailed(str(e)) from e
+
+
+def _wait_client(client: _Adapter, server: _Adapter, deadline: float) -> None:
+    """Until the client exits, the server exits with a decisive code, or the deadline passes."""
+    while not client.wait_exit(min(deadline, time.monotonic() + _POLL_INTERVAL)):
+        if time.monotonic() >= deadline or (server.poll_exit() and server.decisive_exit):
+            return
+
+
 def _execute(
     scenario: Scenario,
     server: _Adapter,
@@ -391,42 +456,47 @@ def _execute(
     pki: TestPki,
     path_factory: PathFactory | None,
     limits: _Limits,
-) -> tuple[Outcome, str | None, object | None]:
-    """Returns (outcome, reason, active path or None)."""
+) -> tuple[str | None, bool, object | None]:
+    """Returns (reason the case was aborted with, server became ready, path or None)."""
     deadline = time.monotonic() + limits.case_timeout
     path = None
     ready = None
-    with contextlib.ExitStack() as stack:
-        try:
-            server.start()
-            ready_deadline = min(deadline, time.monotonic() + limits.ready_timeout)
-            ready = server.wait_ready(ready_deadline)
-            if ready is None:
-                # stdout closes just before the process exits; collect the exit code, don't kill.
-                server.wait_exit(ready_deadline)
-            else:
+    try:
+        with contextlib.ExitStack() as stack:
+            try:
+                server.start()
+                ready_deadline = min(deadline, time.monotonic() + limits.ready_timeout)
+                ready = server.wait_ready(ready_deadline)
+                if ready is None:
+                    # stdout closes just before the process exits; collect the exit code.
+                    server.wait_exit(ready_deadline)
+                    return None, False, path
                 port = ready_port(ready)
                 if port is None:
                     raise _Abort(f"server: ready line without a valid port: {ready!r}")
                 address: Address = (LOOPBACK, port)
                 if path_factory is not None:
                     try:
-                        path = stack.enter_context(path_factory(address, scenario.path))
+                        cm = path_factory(address, scenario.path)
+                        path = stack.enter_context(_GuardedPath(cm))
                     except Exception as e:  # plugin boundary: a refusal is a recorded error
                         raise _Abort(f"path setup failed: {e}") from e
                     address = path.address
                 client.command = client_command(client.impl, scenario, address, pki)
                 client.start()
-                if client.wait_exit(deadline):
+                _wait_client(client, server, deadline)
+                if client.exit_code is not None and not client.decisive_exit:
                     server.wait_exit(min(deadline, time.monotonic() + limits.server_grace))
-        except _Abort as e:
-            return Outcome.ERROR, str(e), path
-        except OSError as e:
-            return Outcome.ERROR, f"cannot start adapter: {e}", path
-        finally:
-            client.stop()
-            server.stop()
-    return *_classify(scenario, server, client, ready is not None, limits), path
+            except _Abort as e:
+                return str(e), ready is not None, path
+            except OSError as e:
+                return f"cannot start adapter: {e}", ready is not None, path
+            finally:
+                client.stop()
+                server.stop()
+    except _PathFailed as e:
+        return f"path failed: {e}", True, path
+    return None, True, path
 
 
 def run_case(
@@ -436,13 +506,14 @@ def run_case(
     *,
     layout: RunLayout,
     pki: TestPki,
-    path_factory: PathFactory | None = None,
+    path_factory: PathFactory | None = proxy_path,
     ready_timeout: float = DEFAULT_READY_TIMEOUT,
     case_timeout: float = DEFAULT_CASE_TIMEOUT,
     server_grace: float = DEFAULT_SERVER_GRACE,
 ) -> CaseResult:
     """Run one case, write <case dir>/result.json, and return the result.
 
+    The path defaults to the UDP proxy; None connects the client to the server directly.
     Both adapter process groups are killed and reaped on every exit path.
     """
     for impl, role in ((client_impl, CLIENT), (server_impl, SERVER)):
@@ -458,11 +529,18 @@ def run_case(
     limits = _Limits(ready_timeout, case_timeout, server_grace)
 
     path = None
+    summary = None
     precheck = _precheck(scenario, path_factory)
     if precheck is not None:
         outcome, reason = Outcome.ERROR, precheck
     else:
-        outcome, reason, path = _execute(scenario, server, client, pki, path_factory, limits)
+        abort, ready, path = _execute(scenario, server, client, pki, path_factory, limits)
+        trace = getattr(path, "trace", None)
+        summary = summarize(trace) if trace is not None else None
+        if abort is not None:
+            outcome, reason = Outcome.ERROR, abort
+        else:
+            outcome, reason = _classify(scenario, server, client, ready, limits, summary)
 
     result = CaseResult(
         schema_version=SCHEMA_VERSION,
@@ -478,8 +556,14 @@ def run_case(
             proxied=path is not None,
             pmtu=scenario.path.pmtu,
             impairments=[str(i) for i in scenario.path.impairments],
+            split_ch1=scenario.path.split_ch1,
+            actions=summary.actions if summary is not None else {},
         ),
         trace=_write_trace(case_dir, path) if path is not None else None,
+        ch1_size=summary.ch1.size if summary and summary.ch1 else None,
+        ch1_fragments=summary.ch1.fragments if summary and summary.ch1 else None,
+        ch2_size=summary.ch2.size if summary and summary.ch2 else None,
+        ch2_fragments=summary.ch2.fragments if summary and summary.ch2 else None,
     )
     write_result(case_dir, result)
     return result

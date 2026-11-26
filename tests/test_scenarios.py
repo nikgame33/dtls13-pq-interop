@@ -19,7 +19,7 @@ KNOWN_GROUPS = {
 
 def _matrix_table() -> dict[str, str]:
     text = (REPO_ROOT / "docs" / "test-matrix.md").read_text()
-    rows = re.findall(r"^\| ([ST]\d\d) \| (.+?) \|", text, flags=re.MULTILINE)
+    rows = re.findall(r"^\| ([ST]\d\d(?:\+split)?) \| (.+?) \|", text, flags=re.MULTILINE)
     return {sid: description.replace("`", "") for sid, description in rows}
 
 
@@ -38,7 +38,10 @@ def test_scenario_is_consistent(scenario):
     assert set(client.groups) <= KNOWN_GROUPS
     assert set(server.groups) <= KNOWN_GROUPS
     assert client.key_share == EMPTY_KEY_SHARE or client.key_share in client.groups
-    assert client.mtu == server.mtu == scenario.path.pmtu
+    if scenario.path.split_ch1 is None:
+        assert client.mtu == server.mtu == scenario.path.pmtu
+    else:
+        assert client.mtu == scenario.path.pmtu
     if scenario.expected.group is not None:
         assert scenario.expected.group in set(client.groups) & set(server.groups)
     exp = scenario.expected
@@ -61,16 +64,35 @@ def test_impairments_only_where_the_matrix_says():
     assert impaired == {
         "S08": (Impairment.REORDER_CH1,),
         "S09": (Impairment.DROP_FIRST_CH1_FRAGMENT,),
+        "S08+split": (Impairment.REORDER_CH1,),
+        "S09+split": (Impairment.DROP_FIRST_CH1_FRAGMENT,),
     }
+
+
+def test_split_rows_change_only_the_mtu_path_and_ch1_expectation():
+    split = [s for s in SCENARIOS if s.path.split_ch1 is not None]
+    assert [s.id for s in split] == ["S03+split", "S04+split", "S08+split", "S09+split"]
+    for s in split:
+        base = scenarios.get(s.id.removesuffix("+split"))
+        assert base.expected.ch1_fragmented is True and base.path.split_ch1 is None
+        assert s.path == dataclasses.replace(base.path, pmtu=1500, split_ch1=2)
+        assert s.client == dataclasses.replace(base.client, mtu=1500)
+        assert s.server == dataclasses.replace(base.server, mtu=1500)
+        assert s.expected.ch1_fragmented is None
+        assert dataclasses.replace(s.expected, summary="", ch1_fragmented=True) == (
+            dataclasses.replace(base.expected, summary="")
+        )
 
 
 def test_hrr_scenarios():
     # Cookie validation, an empty share and a wrong guess all force a HelloRetryRequest.
     hrr = {s.id for s in SCENARIOS if s.expected.hrr}
-    assert hrr == {"S04", "S05", "S06", "S07", "S08", "S09", "S10", "T01"}
+    base = {"S04", "S05", "S06", "S07", "S08", "S09", "S10", "T01"}
+    assert hrr == base | {"S04+split", "S08+split", "S09+split"}
 
 
 def test_get_is_case_insensitive_and_rejects_unknown():
     assert scenarios.get("s03").id == "S03"
+    assert scenarios.get("s03+SPLIT").id == "S03+split"
     with pytest.raises(KeyError, match="unknown scenario 'S99'"):
         scenarios.get("S99")

@@ -22,6 +22,7 @@ BEHAVIOURS = (
     "bad-result",
     "crash",
     "fail",
+    "exit2-on-ping",
 )
 ROLE_OPTIONS = {
     "client": {"key_share"},
@@ -158,6 +159,9 @@ def main():
         data, peer = sock.recvfrom(2048)
         if args.behave == "crash":
             os.kill(os.getpid(), signal.SIGKILL)
+        if args.behave == "exit2-on-ping":
+            result(args, False, "unsupported, found out during the handshake")
+            return 2
         if data != b"ping":
             result(args, False, f"unexpected payload {data!r}")
             return 1
