@@ -30,7 +30,7 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 
 - [x] OpenSSL 4.1.0: C adapter on the listener API, `accept` server variant (PR #4)
 - [x] wolfSSL v5.9.4-stable: DTLS 1.3 + ML-KEM hybrids; client never fragments CH1, server reassembles it only in the `accept-tls13` variant without cookie (PR #5)
-- [ ] BoringSSL: pin a commit; small C/C++ adapter (bssl tool has no DTLS)
+- [x] BoringSSL: pin a commit; small C/C++ adapter (bssl tool has no DTLS) (PR #10)
 - [ ] NSS: pin a release; check `tstclnt`/`selfserv` DTLS 1.3 + group options, otherwise a small adapter
 - [ ] mbedTLS 4.3.0: TLS 1.3 only, for T01 (HRR cookie echo); confirm DTLS 1.3 is really absent upstream
 - [ ] Document per implementation which matrix options map to which flags or API calls, and which are unsupported
@@ -62,4 +62,5 @@ Each item: `build.sh` with pinned version and checksum, `run` adapter per docs/s
 
 - [ ] Ask John Mattsson for the CipherSnake configurations behind his findings, so we test the same settings
 - [x] Include GnuTLS? (check DTLS 1.3 status) - no, not in 3.8.14 or master, see [library survey](docs/research/library-survey.md#gnutls)
-- [ ] Which BoringSSL commit and NSS release to pin (latest at time of Phase 2)
+- [x] Which BoringSSL commit to pin: f3ba8e44 (2026-11-24), tip of main at Phase 2 (PR #10)
+- [ ] Which NSS release to pin (latest at time of Phase 2)
