@@ -1,0 +1,10 @@
+#!/bin/sh
+# Adapter entry point (docs/shim-interface.md); the binary is built by build.sh.
+dir=$(cd "$(dirname "$0")" && pwd)
+bin="$dir/../../.build/nss/bin/nss-adapter"
+if [ ! -x "$bin" ]; then
+    echo "nss adapter not built; run implementations/nss/build.sh" >&2
+    echo '{"event": "result", "ok": false, "version": null, "group": null, "hrr": null, "hrr_cookie": null, "hrr_group": null, "resumed": null, "error": "adapter not built"}'
+    exit 1
+fi
+exec "$bin" "$@"
